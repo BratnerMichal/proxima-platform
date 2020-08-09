@@ -75,7 +75,8 @@
   </distributionManagement>
 
   <properties>
-    <maven.shade.version>3.2.3</maven.shade.version>
+    <maven.shade.version>3.2.4</maven.shade.version>
+    <maven.javadoc.version>3.2.0</maven.javadoc.version>
     <groovy.version>3.0.4</groovy.version>
     <hadoop.version>2.10.0</hadoop.version>
     <hbase.version>1.5.0</hbase.version>
@@ -83,7 +84,7 @@
     <proto.version>3.11.1</proto.version>
     <protoc.version>3.11.1</protoc.version>
     <grpc.version>1.27.2</grpc.version>
-    <gmaven.version>1.9.0</gmaven.version>
+    <gmaven.version>1.10.0</gmaven.version>
     <guava.version>28.1-jre</guava.version>
     <commons-io.version>2.6</commons-io.version>
     <license-maven-plugin.version>3.0</license-maven-plugin.version>
@@ -93,14 +94,14 @@
     <argLine></argLine>
     <surefire.forkCount>8</surefire.forkCount>
     <!-- sonar config -->
-    <jacoco.version>0.8.4</jacoco.version>
+    <jacoco.version>0.8.5</jacoco.version>
     <sonar.organization>datadriven</sonar.organization>
     <sonar.host.url>https://sonarcloud.io</sonar.host.url>
     <sonar.login>21787938b088389dc6edfdf1cf4008e91b81e70b</sonar.login>
     <error-prone.version>2.3.3</error-prone.version>
     <coreShade>cz.o2.proxima.internal.shaded</coreShade>
     <lombok.version>1.18.10</lombok.version>
-    <spotless.version>1.26.1</spotless.version>
+    <spotless.version>2.0.1</spotless.version>
     <!-- apache beam related properties -->
     <apache.beam.groupId>org.apache.beam</apache.beam.groupId>
     <apache.beam.version>2.23.0</apache.beam.version>
@@ -293,7 +294,7 @@
           <plugin>
             <groupId>org.apache.maven.plugins</groupId>
             <artifactId>maven-javadoc-plugin</artifactId>
-            <version>3.1.1</version>
+            <version>${maven.javadoc.version}</version>
             <configuration>
               <source>8</source>
             </configuration>
@@ -302,6 +303,8 @@
                 <reports>
                   <report>javadoc</report>
                   <report>test-javadoc</report>
+                  <report>aggregate-no-fork</report>
+                  <report>test-aggregate-no-fork</report>
                 </reports>
               </reportSet>
               <reportSet>
@@ -428,7 +431,7 @@
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-javadoc-plugin</artifactId>
-        <version>3.1.1</version>
+        <version>${maven.javadoc.version}</version>
         <executions>
           <execution>
             <id>attach-javadocs</id>
@@ -439,6 +442,7 @@
         </executions>
         <configuration>
           <source>8</source>
+          <doclint>none</doclint>
         </configuration>
       </plugin>
 
