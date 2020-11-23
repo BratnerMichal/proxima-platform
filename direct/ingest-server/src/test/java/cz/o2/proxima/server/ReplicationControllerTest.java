@@ -28,13 +28,13 @@ import cz.o2.proxima.direct.core.BulkAttributeWriter;
 import cz.o2.proxima.direct.core.CommitCallback;
 import cz.o2.proxima.direct.core.DirectDataOperator;
 import cz.o2.proxima.direct.core.OnlineAttributeWriter;
-import cz.o2.proxima.direct.core.Partition;
 import cz.o2.proxima.direct.storage.InMemStorage;
 import cz.o2.proxima.functional.UnaryPredicate;
 import cz.o2.proxima.repository.AttributeDescriptor;
 import cz.o2.proxima.repository.EntityDescriptor;
 import cz.o2.proxima.repository.Repository;
 import cz.o2.proxima.server.metrics.Metrics;
+import cz.o2.proxima.storage.Partition;
 import cz.o2.proxima.storage.PassthroughFilter;
 import cz.o2.proxima.storage.StreamElement;
 import java.net.URI;
@@ -249,6 +249,11 @@ public class ReplicationControllerTest {
       }
 
       @Override
+      public Factory<?> asFactory() {
+        return repo -> fakeOnlineWriter(written);
+      }
+
+      @Override
       public URI getUri() {
         return URI.create("fake-online:///");
       }
@@ -273,6 +278,11 @@ public class ReplicationControllerTest {
           buffered.clear();
           statusCallback.commit(true, null);
         }
+      }
+
+      @Override
+      public Factory<?> asFactory() {
+        return repo -> fakeBulkWriter(written, commitWatermarkPredicate);
       }
 
       @Override

@@ -197,7 +197,7 @@ First, let's introduce some glossary:
       <plugin>
         <groupId>cz.o2.proxima</groupId>
         <artifactId>compiler-maven-plugin</artifactId>
-        <version>0.4.0</version>
+        <version>0.5.0</version>
         <configuration>
           <outputDir>${project.build.directory}/generated-sources/model</outputDir>
           <javaPackage>cz.o2.proxima.testing.model</javaPackage>
@@ -219,7 +219,7 @@ First, let's introduce some glossary:
           <dependency>
             <groupId>${project.groupId}</groupId>
             <artifactId>proxima-direct-compiler-plugin</artifactId>
-            <version>0.4.0</version>
+            <version>0.5.0</version>
           </dependency>
           <!--
             The following dependencies define additional
@@ -234,12 +234,12 @@ First, let's introduce some glossary:
           <dependency>
             <groupId>${project.groupId}</groupId>
             <artifactId>proxima-scheme-proto</artifactId>
-            <version>0.4.0</version>
+            <version>0.5.0</version>
           </dependency>
           <dependency>
             <groupId>${project.groupId}</groupId>
             <artifactId>proxima-scheme-proto</artifactId>
-            <version>0.4.0</version>
+            <version>0.5.0</version>
             <classifier>tests</classifier>
           </dependency>
         </dependencies>
@@ -265,7 +265,7 @@ First, let's introduce some glossary:
  ```java
     private DirectDataOperator createDataOperator(Model model) {
       Repository repo = model.getRepo();
-      return repo.asDataOperator(DirectDataOperator.class);
+      return repo.getOrCreateOperator(DirectDataOperator.class);
     }
  ```
  Next, we can use the operator to create instances of data accessors, namely:
@@ -275,7 +275,7 @@ First, let's introduce some glossary:
 
  For instance, observing commit log can be done by
  ```java
-    DirectDataOperator operator = model.getRepo().asDataOperator(DirectDataOperator.class);
+    DirectDataOperator operator = model.getRepo().getOrCreateOperator(DirectDataOperator.class);
     CommitLogReader commitLog = operator.getCommitLogReader(
         model.getEvent().getDataDescriptor())
         .orElseThrow(() -> new IllegalArgumentException("Missing commit log for "
@@ -298,12 +298,12 @@ First, let's introduce some glossary:
 
     });
  ```
- Creating BatchLogObservable or RandomAccessReader is analogous.
+ Creating BatchLogReader or RandomAccessReader is analogous.
 
  ### [Apache Beam](https://beam.apache.org/) access to data
  First, create BeamDataOperator as follows:
  ```java
-   BeamDataOperator operator = model.getRepo().asDataOperator(BeamDataOperator.class);
+   BeamDataOperator operator = model.getRepo().getOrCreateOperator(BeamDataOperator.class);
  ```
  Next, use this operator to create PCollection from Model.
  ```java

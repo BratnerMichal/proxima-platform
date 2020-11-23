@@ -16,24 +16,26 @@
 package cz.o2.proxima.direct.storage;
 
 import com.google.common.base.Preconditions;
-import cz.o2.proxima.direct.batch.BatchLogObservable;
 import cz.o2.proxima.direct.batch.BatchLogObserver;
+import cz.o2.proxima.direct.batch.BatchLogObservers;
+import cz.o2.proxima.direct.batch.BatchLogReader;
+import cz.o2.proxima.direct.batch.ObserveHandle;
+import cz.o2.proxima.direct.batch.TerminationContext;
 import cz.o2.proxima.direct.core.AbstractBulkAttributeWriter;
 import cz.o2.proxima.direct.core.AttributeWriterBase;
+import cz.o2.proxima.direct.core.BulkAttributeWriter;
 import cz.o2.proxima.direct.core.CommitCallback;
 import cz.o2.proxima.direct.core.Context;
 import cz.o2.proxima.direct.core.DataAccessor;
 import cz.o2.proxima.direct.core.DataAccessorFactory;
 import cz.o2.proxima.direct.core.DirectDataOperator;
-import cz.o2.proxima.direct.core.Partition;
-import cz.o2.proxima.functional.Factory;
 import cz.o2.proxima.repository.AttributeDescriptor;
 import cz.o2.proxima.repository.EntityDescriptor;
 import cz.o2.proxima.storage.AbstractStorage;
+import cz.o2.proxima.storage.Partition;
 import cz.o2.proxima.storage.StreamElement;
 import cz.o2.proxima.util.Pair;
 import java.net.URI;
-import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -41,8 +43,8 @@ import java.util.NavigableMap;
 import java.util.Optional;
 import java.util.TreeMap;
 import java.util.UUID;
-import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
+import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 
 /** Storage acting as a bulk in memory storage. */
@@ -83,6 +85,14 @@ public class InMemBulkStorage implements DataAccessorFactory {
       }
     }
 
+    @SuppressWarnings("unchecked")
+    @Override
+    public BulkAttributeWriter.Factory<?> asFactory() {
+      final EntityDescriptor entity = getEntityDescriptor();
+      final URI uri = getUri();
+      return repo -> new Writer(entity, uri);
+    }
+
     void commit() {
       Optional.ofNullable(toCommit).ifPresent(c -> c.commit(true, null));
       writtenSinceLastCommit = 0;
@@ -100,13 +110,15 @@ public class InMemBulkStorage implements DataAccessorFactory {
     }
   }
 
-  private static class BatchObservable extends AbstractStorage implements BatchLogObservable {
+  private static class BatchReader extends AbstractStorage implements BatchLogReader {
 
-    private final Factory<ExecutorService> executorFactory;
+    private final cz.o2.proxima.functional.Factory<ExecutorService> executorFactory;
     private transient ExecutorService executor;
 
-    private BatchObservable(
-        EntityDescriptor entityDesc, URI uri, Factory<ExecutorService> executorFactory) {
+    private BatchReader(
+        EntityDescriptor entityDesc,
+        URI uri,
+        cz.o2.proxima.functional.Factory<ExecutorService> executorFactory) {
 
       super(entityDesc, uri);
       this.executorFactory = executorFactory;
@@ -114,57 +126,93 @@ public class InMemBulkStorage implements DataAccessorFactory {
 
     @Override
     public List<Partition> getPartitions(long startStamp, long endStamp) {
-      return Arrays.asList(() -> 0);
+      return Collections.singletonList(() -> 0);
     }
 
     @Override
-    public void observe(
+    public ObserveHandle observe(
         List<Partition> partitions,
         List<AttributeDescriptor<?>> attributes,
         BatchLogObserver observer) {
 
+      TerminationContext terminationContext = new TerminationContext(observer);
+      observeInternal(partitions, attributes, observer, terminationContext);
+      return terminationContext.asObserveHandle();
+    }
+
+    private void observeInternal(
+        List<Partition> partitions,
+        List<AttributeDescriptor<?>> attributes,
+        BatchLogObserver observer,
+        TerminationContext terminationContext) {
+
       Preconditions.checkArgument(
-          partitions.size() == 1,
-          "This observable works on single partition only, got " + partitions);
-      int prefix = getUri().getPath().length() + 1;
+          partitions.size() == 1, "This reader works on single partition only, got " + partitions);
+      String prefix = getUri().getPath();
       executor()
-          .execute(
+          .submit(
               () -> {
                 try {
-                  InMemBulkStorage.data.forEach(
-                      (k, v) -> {
-                        String[] parts = k.substring(prefix).split("#");
-                        String key = parts[0];
-                        String attribute = parts[1];
-                        getEntityDescriptor()
-                            .findAttribute(attribute, true)
-                            .flatMap(
-                                desc ->
-                                    attributes.contains(desc)
-                                        ? Optional.of(desc)
-                                        : Optional.empty())
-                            .ifPresent(
-                                desc -> {
-                                  observer.onNext(
-                                      StreamElement.upsert(
-                                          getEntityDescriptor(),
-                                          desc,
-                                          UUID.randomUUID().toString(),
-                                          key,
-                                          attribute,
-                                          v.getFirst(),
-                                          v.getSecond()),
-                                      Partition.of(0));
-                                });
-                      });
-                  observer.onCompleted();
+                  for (Map.Entry<String, Pair<Long, byte[]>> e : InMemBulkStorage.data.entrySet()) {
+                    if (!processRecord(attributes, observer, terminationContext, prefix, e)) {
+                      break;
+                    }
+                  }
+                  terminationContext.finished();
                 } catch (Throwable err) {
-                  observer.onError(err);
+                  terminationContext.handleErrorCaught(
+                      err,
+                      () -> observeInternal(partitions, attributes, observer, terminationContext));
                 }
               });
     }
 
-    private Executor executor() {
+    private boolean processRecord(
+        List<AttributeDescriptor<?>> attributes,
+        BatchLogObserver observer,
+        TerminationContext terminationContext,
+        String prefix,
+        Map.Entry<String, Pair<Long, byte[]>> e) {
+
+      if (terminationContext.isCancelled()) {
+        return false;
+      }
+      if (!e.getKey().startsWith(prefix)) {
+        return false;
+      }
+      String k = e.getKey();
+      Pair<Long, byte[]> v = e.getValue();
+      String[] parts = k.substring(prefix.length()).split("#");
+      String key = parts[0];
+      String attribute = parts[1];
+      return getEntityDescriptor()
+          .findAttribute(attribute, true)
+          .filter(attributes::contains)
+          .map(
+              desc ->
+                  observer.onNext(
+                      StreamElement.upsert(
+                          getEntityDescriptor(),
+                          desc,
+                          UUID.randomUUID().toString(),
+                          key,
+                          attribute,
+                          v.getFirst(),
+                          v.getSecond()),
+                      BatchLogObservers.defaultContext(Partition.of(0))))
+          .orElse(true);
+    }
+
+    @Override
+    public Factory<?> asFactory() {
+      final EntityDescriptor entity = getEntityDescriptor();
+      final URI uri = getUri();
+      final cz.o2.proxima.functional.Factory<ExecutorService> executorFactory =
+          this.executorFactory;
+      return repo -> new BatchReader(entity, uri, executorFactory);
+    }
+
+    private ExecutorService executor() {
       if (executor == null) {
         executor = executorFactory.apply();
       }
@@ -177,7 +225,7 @@ public class InMemBulkStorage implements DataAccessorFactory {
     private static final long serialVersionUID = 1L;
 
     private final EntityDescriptor entityDesc;
-    private final URI uri;
+    @Getter private final URI uri;
 
     InMemBulkAccessor(EntityDescriptor entityDesc, URI uri) {
       this.entityDesc = entityDesc;
@@ -190,8 +238,8 @@ public class InMemBulkStorage implements DataAccessorFactory {
     }
 
     @Override
-    public Optional<BatchLogObservable> getBatchLogObservable(Context context) {
-      return Optional.of(new BatchObservable(entityDesc, uri, () -> context.getExecutorService()));
+    public Optional<BatchLogReader> getBatchLogReader(Context context) {
+      return Optional.of(new BatchReader(entityDesc, uri, () -> context.getExecutorService()));
     }
   }
 

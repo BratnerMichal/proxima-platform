@@ -23,7 +23,7 @@
   <parent>
     <groupId>cz.o2.proxima</groupId>
     <artifactId>proxima-direct</artifactId>
-    <version>0.5-SNAPSHOT</version>
+    <version>0.6-SNAPSHOT</version>
   </parent>
 
   <artifactId>proxima-direct-io-http</artifactId>
@@ -113,6 +113,14 @@
     <dependency>
       <groupId>cz.o2.proxima</groupId>
       <artifactId>proxima-core</artifactId>
+      <version>${project.version}</version>
+      <classifier>tests</classifier>
+      <scope>test</scope>
+    </dependency>
+
+    <dependency>
+      <groupId>cz.o2.proxima</groupId>
+      <artifactId>proxima-direct-core</artifactId>
       <version>${project.version}</version>
       <classifier>tests</classifier>
       <scope>test</scope>

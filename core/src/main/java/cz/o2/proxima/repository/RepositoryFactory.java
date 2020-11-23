@@ -16,7 +16,7 @@
 package cz.o2.proxima.repository;
 
 import com.google.common.annotations.VisibleForTesting;
-import com.google.common.base.Preconditions;
+import com.google.common.base.MoreObjects;
 import com.typesafe.config.Config;
 import com.typesafe.config.ConfigFactory;
 import com.typesafe.config.ConfigRenderOptions;
@@ -25,6 +25,7 @@ import java.io.Serializable;
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import lombok.Getter;
 
 /** Factory for {@link cz.o2.proxima.repository.Repository}. */
 @FunctionalInterface
@@ -44,9 +45,19 @@ public interface RepositoryFactory extends Serializable {
 
     @Override
     public Repository apply() {
-      return Repository.of(
-          ConfigFactory.parseString(
-              StringCompressions.gunzip(compressedConfig, StandardCharsets.UTF_8)));
+      return Repository.of(getConfig());
+    }
+
+    Config getConfig() {
+      return ConfigFactory.parseString(
+          StringCompressions.gunzip(compressedConfig, StandardCharsets.UTF_8));
+    }
+
+    @Override
+    public String toString() {
+      return MoreObjects.toStringHelper(this)
+          .add("compressedConfig.length", compressedConfig.length)
+          .toString();
     }
   }
 
@@ -57,7 +68,7 @@ public interface RepositoryFactory extends Serializable {
     private static long initializedFrom = Long.MIN_VALUE;
     private static Repository repo;
 
-    private final long version = System.currentTimeMillis();
+    @Getter private final long version = System.currentTimeMillis();
     private final RepositoryFactory underlying;
 
     private VersionedCaching(RepositoryFactory underlying, Repository created) {
@@ -73,7 +84,7 @@ public interface RepositoryFactory extends Serializable {
       synchronized (Repository.class) {
         if (initializedFrom < version) {
           ConfigRepository.dropCached();
-          repo = underlying.apply();
+          repo = ((ConfigRepository) underlying.apply()).withFactory(this);
           initializedFrom = version;
         }
       }
@@ -81,10 +92,19 @@ public interface RepositoryFactory extends Serializable {
     }
 
     @VisibleForTesting
-    static void drop() {
+    public static void drop() {
       ConfigRepository.dropCached();
       initializedFrom = Long.MIN_VALUE;
       repo = null;
+    }
+
+    @Override
+    public String toString() {
+      return MoreObjects.toStringHelper(this)
+          .add("version", version)
+          .add("underlying", underlying)
+          .add("classLoader", getClass().getClassLoader())
+          .toString();
     }
   }
 
@@ -94,16 +114,27 @@ public interface RepositoryFactory extends Serializable {
 
     private static final Map<Integer, Repository> localMap = new ConcurrentHashMap<>();
 
-    private final int hashCode;
+    static void drop() {
+      localMap.clear();
+    }
 
-    private LocalInstance(Repository repo) {
+    private final int hashCode;
+    private final RepositoryFactory factory;
+
+    private LocalInstance(Repository repo, RepositoryFactory factory) {
       this.hashCode = System.identityHashCode(repo);
-      Preconditions.checkState(localMap.put(System.identityHashCode(repo), repo) == null);
+      this.factory = factory;
+      localMap.put(this.hashCode, repo);
     }
 
     @Override
     public Repository apply() {
-      return localMap.get(hashCode);
+      return localMap.computeIfAbsent(hashCode, k -> factory.apply());
+    }
+
+    @Override
+    public String toString() {
+      return MoreObjects.toStringHelper(this).add("hashCode", hashCode).toString();
     }
   }
 
@@ -115,8 +146,8 @@ public interface RepositoryFactory extends Serializable {
     return new VersionedCaching(factory, current);
   }
 
-  static RepositoryFactory local(Repository repository) {
-    return new LocalInstance(repository);
+  static RepositoryFactory local(Repository repository, RepositoryFactory factory) {
+    return new LocalInstance(repository, factory);
   }
 
   /**

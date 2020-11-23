@@ -15,7 +15,7 @@
  */
 package cz.o2.proxima.direct.blob;
 
-import cz.o2.proxima.direct.batch.BatchLogObservable;
+import cz.o2.proxima.direct.batch.BatchLogReader;
 import cz.o2.proxima.direct.bulk.FileSystem;
 import cz.o2.proxima.direct.bulk.Path;
 import cz.o2.proxima.direct.core.AttributeWriterBase;
@@ -28,6 +28,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.io.Serializable;
 import java.net.URI;
 import java.util.Collections;
 import java.util.List;
@@ -84,6 +85,11 @@ public class TestBlobStorageAccessor extends BlobStorageAccessor {
     public void delete() {}
   }
 
+  @FunctionalInterface
+  interface Runnable extends Serializable {
+    void run();
+  }
+
   class TestBlobFileSystem implements FileSystem {
 
     private static final long serialVersionUID = 1L;
@@ -95,7 +101,7 @@ public class TestBlobStorageAccessor extends BlobStorageAccessor {
       this(null, new AtomicReference<>());
     }
 
-    TestBlobFileSystem(Runnable afterWrite, AtomicReference<Runnable> onWrite) {
+    TestBlobFileSystem(@Nullable Runnable afterWrite, AtomicReference<Runnable> onWrite) {
       this.afterWrite = afterWrite;
       this.preWrite = onWrite;
     }
@@ -145,19 +151,22 @@ public class TestBlobStorageAccessor extends BlobStorageAccessor {
 
   class BlobWriter extends BulkBlobWriter<TestBlob, TestBlobStorageAccessor> {
 
-    private static final long serialVersionUID = 1L;
-
     public BlobWriter(Context context) {
       super(TestBlobStorageAccessor.this, context);
     }
 
     @Override
     protected void deleteBlobIfExists(TestBlob blob) {}
+
+    @Override
+    public Factory<?> asFactory() {
+      final Context context = getContext();
+      final TestBlobStorageAccessor accessor = TestBlobStorageAccessor.this;
+      return repo -> accessor.new BlobWriter(context);
+    }
   }
 
-  class BlobReader extends BlobLogObservable<TestBlob, TestBlobPath> {
-
-    private static final long serialVersionUID = 1L;
+  class BlobReader extends BlobLogReader<TestBlob, TestBlobPath> {
 
     public BlobReader(Context context) {
       super(TestBlobStorageAccessor.this, context);
@@ -171,6 +180,13 @@ public class TestBlobStorageAccessor extends BlobStorageAccessor {
     @Override
     protected BlobPath<TestBlob> createPath(TestBlob blob) {
       return new TestBlobPath(fs, blob);
+    }
+
+    @Override
+    public Factory<?> asFactory() {
+      final Context context = getContext();
+      final TestBlobStorageAccessor accessor = TestBlobStorageAccessor.this;
+      return repo -> accessor.new BlobReader(context);
     }
   }
 
@@ -203,7 +219,7 @@ public class TestBlobStorageAccessor extends BlobStorageAccessor {
   }
 
   @Override
-  public Optional<BatchLogObservable> getBatchLogObservable(Context context) {
+  public Optional<BatchLogReader> getBatchLogReader(Context context) {
     return Optional.of(new BlobReader(context));
   }
 

@@ -22,7 +22,6 @@ import cz.o2.proxima.direct.commitlog.ObserveHandle;
 import cz.o2.proxima.direct.commitlog.Offset;
 import cz.o2.proxima.direct.core.CommitCallback;
 import cz.o2.proxima.direct.core.OnlineAttributeWriter;
-import cz.o2.proxima.direct.core.Partition;
 import cz.o2.proxima.direct.randomaccess.KeyValue;
 import cz.o2.proxima.direct.randomaccess.RandomOffset;
 import cz.o2.proxima.direct.randomaccess.RawOffset;
@@ -30,6 +29,7 @@ import cz.o2.proxima.functional.BiConsumer;
 import cz.o2.proxima.functional.Consumer;
 import cz.o2.proxima.repository.AttributeDescriptor;
 import cz.o2.proxima.repository.EntityDescriptor;
+import cz.o2.proxima.storage.Partition;
 import cz.o2.proxima.storage.StreamElement;
 import cz.o2.proxima.storage.commitlog.Position;
 import cz.o2.proxima.util.Pair;
@@ -372,5 +372,15 @@ public class LocalCachedPartitionedView implements CachedView {
   @Override
   public Collection<Partition> getPartitions() {
     return reader.getPartitions();
+  }
+
+  @Override
+  public Factory asFactory() {
+    final CommitLogReader.Factory<?> readerFactory = reader.asFactory();
+    final OnlineAttributeWriter.Factory<?> writerFactory = writer.asFactory();
+    final EntityDescriptor entity = this.entity;
+    return repo ->
+        new LocalCachedPartitionedView(
+            entity, readerFactory.apply(repo), writerFactory.apply(repo));
   }
 }

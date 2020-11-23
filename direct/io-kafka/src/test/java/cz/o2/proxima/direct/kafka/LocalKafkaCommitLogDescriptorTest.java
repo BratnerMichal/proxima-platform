@@ -30,7 +30,6 @@ import cz.o2.proxima.direct.commitlog.RetryableLogObserver;
 import cz.o2.proxima.direct.core.Context;
 import cz.o2.proxima.direct.core.DirectDataOperator;
 import cz.o2.proxima.direct.core.OnlineAttributeWriter;
-import cz.o2.proxima.direct.core.Partition;
 import cz.o2.proxima.direct.kafka.LocalKafkaCommitLogDescriptor.Accessor;
 import cz.o2.proxima.direct.kafka.LocalKafkaCommitLogDescriptor.LocalKafkaLogReader;
 import cz.o2.proxima.direct.kafka.LocalKafkaCommitLogDescriptor.LocalKafkaWriter;
@@ -43,6 +42,7 @@ import cz.o2.proxima.repository.AttributeDescriptorBase;
 import cz.o2.proxima.repository.ConfigRepository;
 import cz.o2.proxima.repository.EntityDescriptor;
 import cz.o2.proxima.repository.Repository;
+import cz.o2.proxima.storage.Partition;
 import cz.o2.proxima.storage.StreamElement;
 import cz.o2.proxima.storage.commitlog.KeyPartitioner;
 import cz.o2.proxima.storage.commitlog.Partitioner;
@@ -106,7 +106,8 @@ public class LocalKafkaCommitLogDescriptorTest implements Serializable {
   private final transient Repository repo =
       ConfigRepository.Builder.ofTest(ConfigFactory.empty()).build();
   private final DirectDataOperator direct =
-      repo.asDataOperator(DirectDataOperator.class, op -> op.withExecutorFactory(serviceFactory));
+      repo.getOrCreateOperator(
+          DirectDataOperator.class, op -> op.withExecutorFactory(serviceFactory));
 
   private final AttributeDescriptorBase<byte[]> attr;
   private final AttributeDescriptorBase<byte[]> attrWildcard;
@@ -1020,7 +1021,11 @@ public class LocalKafkaCommitLogDescriptorTest implements Serializable {
             direct,
             entity,
             storageUri,
-            and(partitionsCfg(3), cfg(Pair.of(KafkaAccessor.EMPTY_POLL_TIME, "1000"))));
+            and(
+                partitionsCfg(3),
+                cfg(
+                    Pair.of(KafkaAccessor.EMPTY_POLL_TIME, "1000"),
+                    Pair.of(KafkaAccessor.ASSIGNMENT_TIMEOUT_MS, "1"))));
     int numObservers = 4;
 
     testPollFromNConsumersMovesWatermarkWithNoWrite(accessor, numObservers);
@@ -1028,7 +1033,7 @@ public class LocalKafkaCommitLogDescriptorTest implements Serializable {
     testPollFromNConsumersMovesWatermark(accessor, numObservers);
   }
 
-  @Test(timeout = 100000)
+  @Test(timeout = 100_000)
   public void testPollFromManyMoreConsumersThanPartitionsMovesWatermark()
       throws InterruptedException {
 
@@ -1037,7 +1042,11 @@ public class LocalKafkaCommitLogDescriptorTest implements Serializable {
             direct,
             entity,
             storageUri,
-            and(partitionsCfg(3), cfg(Pair.of(KafkaAccessor.EMPTY_POLL_TIME, "1000"))));
+            and(
+                partitionsCfg(3),
+                cfg(
+                    Pair.of(KafkaAccessor.EMPTY_POLL_TIME, "1000"),
+                    Pair.of(KafkaAccessor.ASSIGNMENT_TIMEOUT_MS, "1"))));
 
     int numObservers = 400;
     testPollFromNConsumersMovesWatermarkWithNoWrite(accessor, numObservers);
@@ -1077,7 +1086,6 @@ public class LocalKafkaCommitLogDescriptorTest implements Serializable {
     Map<LogObserver, Long> observerWatermarks = new ConcurrentHashMap<>();
     AtomicInteger readyObservers = new AtomicInteger();
     for (int i = 0; i < numObservers; i++) {
-      int observerId = i;
       reader
           .observe(
               "test-" + expectMoved,
@@ -1132,7 +1140,14 @@ public class LocalKafkaCommitLogDescriptorTest implements Serializable {
 
   @Test(timeout = 10000)
   public void testObserveBulkCommitsCorrectly() throws InterruptedException {
-    Accessor accessor = kafka.createAccessor(direct, entity, storageUri, partitionsCfg(3));
+    Accessor accessor =
+        kafka.createAccessor(
+            direct,
+            entity,
+            storageUri,
+            cfg(
+                Pair.of(KafkaAccessor.ASSIGNMENT_TIMEOUT_MS, 1L),
+                Pair.of(LocalKafkaCommitLogDescriptor.CFG_NUM_PARTITIONS, 3)));
     LocalKafkaWriter writer = accessor.newWriter();
     CommitLogReader reader =
         accessor
@@ -2433,7 +2448,7 @@ public class LocalKafkaCommitLogDescriptorTest implements Serializable {
   @Test(timeout = 5000)
   public void testNoMaxBytesPerSec() throws InterruptedException {
     long maxLatency = testSequentialConsumption(Long.MAX_VALUE);
-    assertTrue(maxLatency < 500000000L);
+    assertTrue(maxLatency < 500_000_000L);
   }
 
   @Test(timeout = 10000)
@@ -2610,6 +2625,7 @@ public class LocalKafkaCommitLogDescriptorTest implements Serializable {
             entity,
             storageUri,
             cfg(
+                Pair.of(KafkaAccessor.ASSIGNMENT_TIMEOUT_MS, 1L),
                 Pair.of(KafkaAccessor.MAX_BYTES_PER_SEC, maxBytesPerSec),
                 Pair.of(KafkaAccessor.MAX_POLL_RECORDS, 1)));
     final LocalKafkaWriter writer = accessor.newWriter();
@@ -2617,9 +2633,10 @@ public class LocalKafkaCommitLogDescriptorTest implements Serializable {
         accessor
             .getCommitLogReader(context())
             .orElseThrow(() -> new IllegalStateException("Missing log reader"));
-    final AtomicLong lastOnNext = new AtomicLong(System.nanoTime());
+    final AtomicLong lastOnNext = new AtomicLong(Long.MIN_VALUE);
     final AtomicLong maxLatency = new AtomicLong(0);
-    final CountDownLatch latch = new CountDownLatch(2);
+    final int numElements = 2;
+    final CountDownLatch latch = new CountDownLatch(numElements);
 
     LogObserver observer =
         new LogObserver() {
@@ -2627,8 +2644,10 @@ public class LocalKafkaCommitLogDescriptorTest implements Serializable {
           public boolean onNext(StreamElement ingest, OnNextContext context) {
             long now = System.nanoTime();
             long last = lastOnNext.getAndSet(now);
-            long latency = now - last;
-            maxLatency.getAndUpdate(old -> Math.max(old, latency));
+            if (last > 0) {
+              long latency = now - last;
+              maxLatency.getAndUpdate(old -> Math.max(old, latency));
+            }
             latch.countDown();
             return true;
           }
@@ -2639,7 +2658,7 @@ public class LocalKafkaCommitLogDescriptorTest implements Serializable {
           }
         };
     reader.observe("dummy", Position.OLDEST, observer);
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < numElements; i++) {
       writer.write(
           StreamElement.upsert(
               entity,

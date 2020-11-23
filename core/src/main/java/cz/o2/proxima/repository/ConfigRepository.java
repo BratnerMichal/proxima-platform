@@ -26,6 +26,8 @@ import com.typesafe.config.ConfigObject;
 import com.typesafe.config.ConfigValue;
 import cz.o2.proxima.functional.BiFunction;
 import cz.o2.proxima.functional.UnaryFunction;
+import cz.o2.proxima.repository.RepositoryFactory.LocalInstance;
+import cz.o2.proxima.repository.RepositoryFactory.VersionedCaching;
 import cz.o2.proxima.scheme.ValueSerializerFactory;
 import cz.o2.proxima.storage.AccessType;
 import cz.o2.proxima.storage.StorageFilter;
@@ -61,6 +63,7 @@ import java.util.Set;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
+import javax.annotation.Nullable;
 import lombok.Getter;
 import lombok.Value;
 import lombok.extern.slf4j.Slf4j;
@@ -135,6 +138,7 @@ public final class ConfigRepository extends Repository {
     private int validate;
     private boolean loadFamilies = true;
     private boolean loadClasses = true;
+    private @Nullable RepositoryFactory factory = null;
 
     private Builder(Config config) {
       this.config = Objects.requireNonNull(config);
@@ -183,8 +187,31 @@ public final class ConfigRepository extends Repository {
     }
 
     public ConfigRepository build() {
-      return new ConfigRepository(
-          config, cachingEnabled, readOnly, validate, loadFamilies, loadClasses);
+      ConfigRepository repo =
+          new ConfigRepository(
+              config, cachingEnabled, readOnly, validate, loadFamilies, loadClasses);
+      RepositoryFactory factory =
+          cachingEnabled
+              ? RepositoryFactory.caching(RepositoryFactory.compressed(config), repo)
+              : RepositoryFactory.local(repo, asFactory());
+      return repo.withFactory(factory);
+    }
+
+    private RepositoryFactory asFactory() {
+      final Config config = this.config;
+      final boolean cachingEnabled = this.cachingEnabled;
+      final boolean loadClasses = this.loadClasses;
+      final boolean loadFamilies = this.loadFamilies;
+      final boolean readOnly = this.readOnly;
+      final int validate = this.validate;
+      return () ->
+          new Builder(config)
+              .withCachingEnabled(cachingEnabled)
+              .withLoadClasses(loadClasses)
+              .withLoadFamilies(loadFamilies)
+              .withReadOnly(readOnly)
+              .withValidateFlag(validate)
+              .build();
     }
   }
 
@@ -279,7 +306,6 @@ public final class ConfigRepository extends Repository {
       boolean loadFamilies,
       boolean loadClasses) {
 
-    super(config, cachingEnabled);
     this.enableCaching = cachingEnabled;
     this.config = config;
     this.readonly = isReadonly;
@@ -312,6 +338,12 @@ public final class ConfigRepository extends Repository {
       }
       cachedConfigConstructed = this.config;
     }
+  }
+
+  /** @return this */
+  ConfigRepository withFactory(RepositoryFactory factory) {
+    this.factory = factory;
+    return this;
   }
 
   public final void reloadConfig(boolean loadFamilies, Config conf) {
@@ -993,6 +1025,13 @@ public final class ConfigRepository extends Repository {
     return what.getFlag() == 0 || (this.validateFlags & what.getFlag()) != 0;
   }
 
+  @Override
+  public void drop() {
+    LocalInstance.drop();
+    VersionedCaching.drop();
+    ConfigRepository.dropCached();
+  }
+
   private void readAttributeFamilies(Config cfg) {
 
     if (entitiesByName.isEmpty()) {
@@ -1334,7 +1373,7 @@ public final class ConfigRepository extends Repository {
       EntityDescriptor entity, String attr, boolean read) {
 
     AttributeDescriptor<?> result = findAttributeRequired(entity, attr);
-    while (((AttributeDescriptorBase<?>) result).isProxy()) {
+    while (result.isProxy()) {
       result =
           read
               ? ((AttributeDescriptorBase<?>) result).toProxy().getReadTarget()
@@ -2005,7 +2044,7 @@ public final class ConfigRepository extends Repository {
   }
 
   @Override
-  public Optional<AttributeFamilyDescriptor> getFamilyByName(String name) {
+  public Optional<AttributeFamilyDescriptor> findFamilyByName(String name) {
     return Optional.ofNullable(allCreatedFamilies.get(name));
   }
 
@@ -2091,6 +2130,11 @@ public final class ConfigRepository extends Repository {
   @Override
   public int hashCode() {
     return Objects.hash(config, enableCaching, readonly, validateFlags, loadClasses);
+  }
+
+  @Override
+  public String toString() {
+    return getClass().getSimpleName() + "@" + System.identityHashCode(this);
   }
 
   @VisibleForTesting

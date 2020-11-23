@@ -23,13 +23,13 @@ import cz.o2.proxima.direct.commitlog.CommitLogReader;
 import cz.o2.proxima.direct.core.DirectAttributeFamilyDescriptor;
 import cz.o2.proxima.direct.core.DirectDataOperator;
 import cz.o2.proxima.direct.core.OnlineAttributeWriter;
-import cz.o2.proxima.direct.core.Partition;
 import cz.o2.proxima.direct.randomaccess.KeyValue;
 import cz.o2.proxima.direct.randomaccess.RandomAccessReader.Listing;
 import cz.o2.proxima.direct.randomaccess.RandomOffset;
 import cz.o2.proxima.repository.AttributeDescriptor;
 import cz.o2.proxima.repository.EntityDescriptor;
 import cz.o2.proxima.repository.Repository;
+import cz.o2.proxima.storage.Partition;
 import cz.o2.proxima.storage.StorageType;
 import cz.o2.proxima.storage.StreamElement;
 import cz.o2.proxima.util.Pair;
@@ -48,7 +48,7 @@ import org.junit.Test;
 public class LocalCachedPartitionedViewTest {
 
   Repository repo = Repository.of(ConfigFactory.load("test-reference.conf").resolve());
-  DirectDataOperator direct = repo.asDataOperator(DirectDataOperator.class);
+  DirectDataOperator direct = repo.getOrCreateOperator(DirectDataOperator.class);
   EntityDescriptor gateway =
       repo.findEntity("gateway")
           .orElseThrow(() -> new IllegalStateException("Missing entity 'gateway'"));

@@ -22,35 +22,38 @@ import static org.junit.Assert.*;
 
 import com.google.cloud.pubsub.v1.MessageReceiver;
 import com.google.cloud.pubsub.v1.Subscriber;
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Sets;
 import com.google.pubsub.v1.ProjectSubscriptionName;
 import com.google.pubsub.v1.PubsubMessage;
 import com.typesafe.config.ConfigFactory;
+import cz.o2.proxima.direct.commitlog.CommitLogReader;
 import cz.o2.proxima.direct.commitlog.LogObserver;
 import cz.o2.proxima.direct.commitlog.LogObserver.OffsetCommitter;
 import cz.o2.proxima.direct.commitlog.ObserveHandle;
 import cz.o2.proxima.direct.commitlog.Offset;
 import cz.o2.proxima.direct.core.Context;
 import cz.o2.proxima.direct.core.DirectDataOperator;
-import cz.o2.proxima.direct.core.Partition;
 import cz.o2.proxima.direct.pubsub.PubSubReader.PubSubOffset;
 import cz.o2.proxima.direct.time.UnboundedOutOfOrdernessWatermarkEstimator;
 import cz.o2.proxima.repository.AttributeDescriptor;
 import cz.o2.proxima.repository.AttributeDescriptorImpl;
 import cz.o2.proxima.repository.EntityDescriptor;
 import cz.o2.proxima.repository.Repository;
+import cz.o2.proxima.storage.Partition;
 import cz.o2.proxima.storage.StreamElement;
 import cz.o2.proxima.storage.commitlog.Position;
 import cz.o2.proxima.time.WatermarkEstimator;
 import cz.o2.proxima.time.WatermarkEstimatorFactory;
 import cz.o2.proxima.time.WatermarkIdlePolicyFactory;
+import cz.o2.proxima.util.TestUtils;
 import io.grpc.internal.GrpcUtil;
+import java.io.IOException;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Deque;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedList;
 import java.util.List;
@@ -72,7 +75,7 @@ public class PubSubReaderTest {
 
   private final Repository repo = Repository.of(ConfigFactory.load().resolve());
   private final DirectDataOperator direct =
-      repo.asDataOperator(
+      repo.getOrCreateOperator(
           DirectDataOperator.class, op -> op.withExecutorFactory(Executors::newCachedThreadPool));
   private final Context context = direct.getContext();
   private final AttributeDescriptorImpl<?> attr;
@@ -142,13 +145,11 @@ public class PubSubReaderTest {
     assertTrue(entity.findAttribute("attr").isPresent());
 
     Map<String, Object> cfg =
-        new HashMap<String, Object>() {
-          {
-            put(
+        ImmutableMap.<String, Object>builder()
+            .put(
                 "watermark.estimator-factory",
-                PubSubReaderTest.TestWatermarkEstimatorFactory.class.getName());
-          }
-        };
+                PubSubReaderTest.TestWatermarkEstimatorFactory.class.getName())
+            .build();
     this.accessor = new PubSubAccessor(storage, entity, new URI("gps://my-project/topic"), cfg);
   }
 
@@ -494,5 +495,12 @@ public class PubSubReaderTest {
   public void testInstantiationHttp2Error() {
     GrpcUtil.Http2Error error = GrpcUtil.Http2Error.NO_ERROR;
     assertNotNull(error);
+  }
+
+  @Test
+  public void testAsFactorySerializable() throws IOException, ClassNotFoundException {
+    byte[] bytes = TestUtils.serializeObject(reader.asFactory());
+    CommitLogReader.Factory<?> factory = TestUtils.deserializeObject(bytes);
+    assertEquals(reader.getUri(), factory.apply(repo).getUri());
   }
 }

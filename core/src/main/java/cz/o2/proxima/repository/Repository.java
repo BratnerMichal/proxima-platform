@@ -24,6 +24,7 @@ import cz.o2.proxima.scheme.ValueSerializerFactory;
 import java.io.Serializable;
 import java.util.Arrays;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.ServiceLoader;
 import java.util.Set;
@@ -31,8 +32,10 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Stream;
 import lombok.AccessLevel;
 import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
 
 /** Repository of all entities configured in the system. */
+@Slf4j
 @Evolving
 public abstract class Repository implements Serializable {
 
@@ -92,28 +95,21 @@ public abstract class Repository implements Serializable {
 
   RepositoryFactory factory;
 
-  @SuppressWarnings("unchecked")
+  Repository() {
+    this.factory =
+        RepositoryFactory.local(
+            this,
+            () -> {
+              throw new UnsupportedOperationException();
+            });
+  }
+
+  @SuppressWarnings({"unchecked", "rawtypes"})
   @Getter(AccessLevel.PACKAGE)
   private final transient Iterable<DataOperatorFactory<?>> dataOperatorFactories =
       (Iterable) ServiceLoader.load(DataOperatorFactory.class);
 
-  private final transient Map<Class<? extends DataOperator>, DataOperator> operatorCache =
-      new ConcurrentHashMap<>();
-
-  /**
-   * Construct the repository.
-   *
-   * @param config the config to create instance of this {@link Config}
-   * @param cachingEnabled enable caching of Repository pre JVM
-   */
-  Repository(Config config, boolean cachingEnabled) {
-    final RepositoryFactory repoFactory =
-        cachingEnabled ? RepositoryFactory.compressed(config) : () -> Repository.ofTest(config);
-    this.factory =
-        cachingEnabled
-            ? RepositoryFactory.caching(repoFactory, this)
-            : RepositoryFactory.local(this);
-  }
+  private final transient Map<String, DataOperator> operatorCache = new ConcurrentHashMap<>();
 
   /**
    * Convert this repository to {@link Serializable} factory.
@@ -121,7 +117,7 @@ public abstract class Repository implements Serializable {
    * @return this repository as factory
    */
   public RepositoryFactory asFactory() {
-    return factory;
+    return Objects.requireNonNull(factory);
   }
 
   /**
@@ -175,14 +171,30 @@ public abstract class Repository implements Serializable {
   /**
    * Retrieve attribute family by name.
    *
-   * <p>Note that this returns all families that were specified in configuration. It might include
+   * <p>Note that this searched all families that were specified in configuration. It might include
    * families not listed in {@link #getAllFamilies()}, because some families might be removed for
    * various reasons (e.g. when proxying attributes).
    *
    * @param name name of the family
    * @return {@link Optional} {@link AttributeFamilyDescriptor} if family exists
    */
-  public abstract Optional<AttributeFamilyDescriptor> getFamilyByName(String name);
+  public abstract Optional<AttributeFamilyDescriptor> findFamilyByName(String name);
+
+  /**
+   * Retrieve attribute family by name.
+   *
+   * <p>Note that this searched all families that were specified in configuration. It might include
+   * families not listed in {@link #getAllFamilies()}, because some families might be removed for
+   * various reasons (e.g. when proxying attributes).
+   *
+   * @param name name of the family
+   * @return {@link AttributeFamilyDescriptor} if family exists
+   * @throws IllegalArgumentException when family doesn't exist
+   */
+  public AttributeFamilyDescriptor getFamilyByName(String name) {
+    return findFamilyByName(name)
+        .orElseThrow(() -> new IllegalArgumentException("Family " + name + " doesn't exist"));
+  }
 
   /**
    * Retrieve list of attribute families for attribute.
@@ -212,7 +224,7 @@ public abstract class Repository implements Serializable {
   @VisibleForTesting
   @SuppressWarnings("unchecked")
   @SafeVarargs
-  public final synchronized <T extends DataOperator> T asDataOperator(
+  private final synchronized <T extends DataOperator> T asDataOperator(
       Class<T> type, Consumer<T>... modifiers) {
 
     Iterable<DataOperatorFactory<?>> loaders = getDataOperatorFactories();
@@ -232,32 +244,33 @@ public abstract class Repository implements Serializable {
 
   <T extends DataOperator> T cacheDataOperator(T op) {
     addedDataOperator(op);
-    operatorCache.put(op.getClass(), op);
+    operatorCache.put(op.getClass().getName(), op);
     return op;
   }
 
   /**
-   * Retrieve an already created (via call to #asDataOperator} instance of data operator or create
-   * new instance with default settings.
+   * Retrieve instance of data operator or create new instance with given settings.
    *
    * @param <T> type of operator
    * @param type the operator class
+   * @param modifiers modifiers of operator applied when the operator is created
    * @return the data operator of given type
    */
   @SuppressWarnings("unchecked")
-  public final synchronized <T extends DataOperator> T getOrCreateOperator(Class<T> type) {
+  public final synchronized <T extends DataOperator> T getOrCreateOperator(
+      Class<T> type, Consumer<T>... modifiers) {
 
-    T ret = (T) operatorCache.get(type);
+    T ret = (T) operatorCache.get(type.getName());
     if (ret != null) {
       return ret;
     }
-    return asDataOperator(type);
+    return asDataOperator(type, modifiers);
   }
 
   /**
    * Check if given implementation of data operator is available on classpath and {@link
-   * #asDataOperator(java.lang.Class, Consumer...)} will return non-null object for class
-   * corresponding the given name.
+   * #getOrCreateOperator(Class, Consumer[])} (java.lang.Class, Consumer...)} will return non-null
+   * object for class corresponding the given name.
    *
    * @param name name of the operator
    * @return {@code true} if the operator is available, {@code false} otherwise
@@ -275,6 +288,12 @@ public abstract class Repository implements Serializable {
    *     production settings, while test settings can be less strict).
    */
   public abstract boolean isShouldValidate(Validate what);
+
+  /**
+   * Drop the {@link Repository} and let it recreate from scratch using factory. This is intended
+   * for use in tests mostly to prevent influence between two test cases.
+   */
+  public abstract void drop();
 
   /**
    * Called when new {@link DataOperator} is created.

@@ -21,7 +21,7 @@ import cz.o2.proxima.direct.commitlog.CommitLogReader;
 import cz.o2.proxima.direct.commitlog.LogObserver.OffsetCommitter;
 import cz.o2.proxima.direct.commitlog.ObserveHandle;
 import cz.o2.proxima.direct.commitlog.Offset;
-import cz.o2.proxima.direct.core.Partition;
+import cz.o2.proxima.storage.Partition;
 import cz.o2.proxima.storage.StreamElement;
 import cz.o2.proxima.storage.commitlog.Position;
 import java.io.IOException;
@@ -56,6 +56,7 @@ class BeamCommitLogReader {
     private final DirectUnboundedSource source;
     @Getter private final BeamCommitLogReader reader;
 
+    private Instant previousWatermark = BoundedWindow.TIMESTAMP_MIN_VALUE;
     private boolean finished = false;
 
     UnboundedCommitLogReader(
@@ -105,7 +106,15 @@ class BeamCommitLogReader {
       if (finished) {
         return HIGHEST_INSTANT;
       }
-      return reader.getWatermark();
+      final Instant currentWatermark = reader.getWatermark();
+      if (currentWatermark.isBefore(previousWatermark)) {
+        log.warn(
+            "Watermark shifts back in time. Previous: [{}], Current: [{}].",
+            previousWatermark,
+            currentWatermark);
+      }
+      previousWatermark = currentWatermark;
+      return currentWatermark;
     }
 
     @Override
@@ -375,6 +384,12 @@ class BeamCommitLogReader {
     if (finished) {
       watermark = HIGHEST_INSTANT;
     } else if (eventTime) {
+      if (observer == null) {
+        // Temporary workaround for race condition in UnboundedSourceWrapper.
+        log.warn(
+            "Call to getWatermark() before start(). This breaks UnboundedSource.Reader contract.");
+        return LOWEST_INSTANT;
+      }
       watermark = new Instant(observer.getWatermark());
     } else {
       watermark = new Instant(System.currentTimeMillis() - AUTO_WATERMARK_LAG_MS);

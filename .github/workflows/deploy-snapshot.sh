@@ -29,12 +29,14 @@ RESUME=""
 if echo ${VERSION} | grep SNAPSHOT >/dev/null && echo ${GITHUB_REPOSITORY} | grep O2-Czech-Republic >/dev/null; then
   TRY=0
   while [ $TRY -lt 3 ]; do
-    CMD="mvn deploy -DskipTests -Prelease-snapshot"
+    CMD="mvn deploy -DskipTests -Prelease-snapshot -Pallow-snapshots"
     if [ ! -z "${RESUME}" ]; then
       CMD="${CMD} $(echo $RESUME | sed "s/.\+\(-rf .\+\)/\1/")"
     fi
     echo "Starting to deploy step $((TRY + 1)) with command ${CMD}"
-    RESUME=$(${CMD} | grep -A1 "After correcting the problems, you can resume the build with the command" | tail -1)
+    touch output${TRY}.log
+    tail -f output${TRY}.log &
+    RESUME=$(${CMD} | tee output${TRY}.log | grep -A1 "After correcting the problems, you can resume the build with the command" | tail -1)
     if [ -z "${RESUME}" ]; then
       break
     fi

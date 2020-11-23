@@ -22,7 +22,7 @@
 
   <groupId>cz.o2.proxima</groupId>
   <artifactId>platform-parent</artifactId>
-  <version>0.5-SNAPSHOT</version>
+  <version>0.6-SNAPSHOT</version>
   <packaging>pom</packaging>
   <inceptionYear>2017</inceptionYear>
 
@@ -77,13 +77,14 @@
   <properties>
     <maven.shade.version>3.2.4</maven.shade.version>
     <maven.javadoc.version>3.2.0</maven.javadoc.version>
+    <maven.surefire.version>3.0.0-M5</maven.surefire.version>
     <groovy.version>3.0.4</groovy.version>
     <hadoop.version>2.10.0</hadoop.version>
     <hbase.version>1.5.0</hbase.version>
-    <kafka.version>2.5.0</kafka.version>
+    <kafka.version>2.6.0</kafka.version>
     <proto.version>3.11.1</proto.version>
     <protoc.version>3.11.1</protoc.version>
-    <grpc.version>1.27.2</grpc.version>
+    <grpc.version>1.29.0</grpc.version>
     <gmaven.version>1.10.0</gmaven.version>
     <guava.version>28.1-jre</guava.version>
     <commons-io.version>2.6</commons-io.version>
@@ -104,9 +105,10 @@
     <spotless.version>2.0.1</spotless.version>
     <!-- apache beam related properties -->
     <apache.beam.groupId>org.apache.beam</apache.beam.groupId>
-    <apache.beam.version>2.23.0</apache.beam.version>
+    <apache.beam.version>2.24.0</apache.beam.version>
     <apache.beam.groupId.raw>org.apache.beam</apache.beam.groupId.raw>
     <apache.beam.version.raw>${apache.beam.version}</apache.beam.version.raw>
+    <zookeeper.version>3.6.2</zookeeper.version>
   </properties>
 
   <profiles>
@@ -188,8 +190,14 @@
       <id>allow-snapshots</id>
       <repositories>
         <repository>
-          <id>snapshots-repo</id>
+          <id>sonatype-snapshots-repo</id>
           <url>https://oss.sonatype.org/content/repositories/snapshots</url>
+          <releases><enabled>false</enabled></releases>
+          <snapshots><enabled>true</enabled></snapshots>
+        </repository>
+        <repository>
+          <id>apache-snapshots-repo</id>
+          <url>https://repository.apache.org/content/repositories/snapshots</url>
           <releases><enabled>false</enabled></releases>
           <snapshots><enabled>true</enabled></snapshots>
         </repository>
@@ -372,7 +380,7 @@
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-surefire-plugin</artifactId>
-        <version>2.22.2</version>
+        <version>${maven.surefire.version}</version>
         <configuration>
           <forkCount>${surefire.forkCount}</forkCount>
           <reuseForks>false</reuseForks>
@@ -382,6 +390,13 @@
           <useManifestOnlyJar>false</useManifestOnlyJar>
           <argLine>@{argLine} -Xmx1g -XX:+HeapDumpOnOutOfMemoryError -XX:-OmitStackTraceInFastThrow -Dsun.io.serialization.extendedDebugInfo=true</argLine>
         </configuration>
+        <dependencies>
+          <dependency>
+            <groupId>org.junit.vintage</groupId>
+            <artifactId>junit-vintage-engine</artifactId>
+            <version>5.7.0</version>
+          </dependency>
+        </dependencies>
       </plugin>
 
       <!-- help managing license headers -->
@@ -409,6 +424,7 @@
             <exclude>**/LICENSE</exclude>
             <exclude>**/src/test/resources/**</exclude>
             <exclude>**/src/main/resources/**</exclude>
+            <exclude>install-jdk.sh</exclude>
           </excludes>
         </configuration>
         <executions>
@@ -526,6 +542,12 @@
       </dependency>
 
       <dependency>
+        <groupId>io.grpc</groupId>
+        <artifactId>grpc-netty</artifactId>
+        <version>${grpc.version}</version>
+      </dependency>
+
+      <dependency>
         <groupId>commons-io</groupId>
         <artifactId>commons-io</artifactId>
         <version>${commons-io.version}</version>
@@ -547,7 +569,7 @@
       <dependency>
         <groupId>junit</groupId>
         <artifactId>junit</artifactId>
-        <version>4.12</version>
+        <version>4.13.1</version>
         <scope>test</scope>
       </dependency>
 
@@ -570,6 +592,7 @@
     <module>maven</module>
     <module>scheme</module>
     <module>tools</module>
+    <module>utils-zookeeper</module>
   </modules>
 
 </project>

@@ -123,5 +123,30 @@ public class ExceptionUtils {
     };
   }
 
+  /**
+   * Run given runnable, swallow any potential {@link InterruptedException} and set current thread's
+   * interrupted flag (if exception caught).
+   *
+   * @param runnable runnable throwing {@link InterruptedException}
+   * @return {@code true} if {@link InterruptedException} was caught
+   */
+  public static boolean ignoringInterrupted(ThrowingRunnable runnable) {
+    try {
+      runnable.run();
+      return false;
+    } catch (InterruptedException ex) {
+      Thread.currentThread().interrupt();
+      return true;
+    } catch (Exception ex) {
+      throw new RuntimeException(ex);
+    }
+  }
+
+  /** Verify that given {@link Throwable} (or any of its causes) is {@link InterruptedException}. */
+  public static boolean isInterrupted(Throwable ex) {
+    return ex instanceof InterruptedException
+        || ex.getCause() != null && isInterrupted(ex.getCause());
+  }
+
   private ExceptionUtils() {}
 }

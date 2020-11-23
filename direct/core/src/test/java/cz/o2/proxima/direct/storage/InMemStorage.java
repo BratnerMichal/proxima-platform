@@ -21,8 +21,11 @@ import com.google.common.base.MoreObjects;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Lists;
-import cz.o2.proxima.direct.batch.BatchLogObservable;
 import cz.o2.proxima.direct.batch.BatchLogObserver;
+import cz.o2.proxima.direct.batch.BatchLogObserver.OnNextContext;
+import cz.o2.proxima.direct.batch.BatchLogObservers;
+import cz.o2.proxima.direct.batch.BatchLogReader;
+import cz.o2.proxima.direct.batch.TerminationContext;
 import cz.o2.proxima.direct.commitlog.CommitLogReader;
 import cz.o2.proxima.direct.commitlog.LogObserver;
 import cz.o2.proxima.direct.commitlog.LogObserver.OffsetCommitter;
@@ -36,7 +39,7 @@ import cz.o2.proxima.direct.core.Context;
 import cz.o2.proxima.direct.core.DataAccessor;
 import cz.o2.proxima.direct.core.DataAccessorFactory;
 import cz.o2.proxima.direct.core.DirectDataOperator;
-import cz.o2.proxima.direct.core.Partition;
+import cz.o2.proxima.direct.core.OnlineAttributeWriter;
 import cz.o2.proxima.direct.randomaccess.KeyValue;
 import cz.o2.proxima.direct.randomaccess.RandomAccessReader;
 import cz.o2.proxima.direct.randomaccess.RandomOffset;
@@ -49,7 +52,10 @@ import cz.o2.proxima.functional.Consumer;
 import cz.o2.proxima.functional.Factory;
 import cz.o2.proxima.repository.AttributeDescriptor;
 import cz.o2.proxima.repository.EntityDescriptor;
+import cz.o2.proxima.repository.Repository;
+import cz.o2.proxima.repository.RepositoryFactory;
 import cz.o2.proxima.storage.AbstractStorage;
+import cz.o2.proxima.storage.Partition;
 import cz.o2.proxima.storage.StreamElement;
 import cz.o2.proxima.storage.commitlog.Position;
 import cz.o2.proxima.time.WatermarkEstimator;
@@ -66,6 +72,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Map.Entry;
 import java.util.NavigableMap;
 import java.util.Objects;
 import java.util.Optional;
@@ -75,7 +82,7 @@ import java.util.TreeMap;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
@@ -85,7 +92,6 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 import javax.annotation.Nullable;
 import lombok.Getter;
-import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
 
 /** InMemStorage for testing purposes. */
@@ -95,6 +101,7 @@ public class InMemStorage implements DataAccessorFactory {
   private static final long serialVersionUID = 1L;
 
   private static final Partition PARTITION = () -> 0;
+  private static final OnNextContext CONTEXT = BatchLogObservers.defaultContext(PARTITION);
   private static final long IDLE_FLUSH_TIME = 500L;
   private static final long BOUNDED_OUT_OF_ORDERNESS = 5000L;
 
@@ -196,6 +203,14 @@ public class InMemStorage implements DataAccessorFactory {
             log.debug("Passed element {} to {}", data, o);
           });
       statusCallback.commit(true, null);
+    }
+
+    @SuppressWarnings("unchecked")
+    @Override
+    public OnlineAttributeWriter.Factory<?> asFactory() {
+      final EntityDescriptor entity = getEntityDescriptor();
+      final URI uri = getUri();
+      return repo -> new Writer(entity, uri);
     }
 
     @Override
@@ -388,7 +403,7 @@ public class InMemStorage implements DataAccessorFactory {
       Set<String> consumedOffsets =
           Collections.synchronizedSet(new HashSet<>(offset.getConsumedKeyAttr()));
       WatermarkEstimator watermark =
-          holder.getWatermarkEstimator(
+          DataHolders.getWatermarkEstimator(
               getUri(),
               offset.getWatermark(),
               MoreObjects.firstNonNull(name, "InMemConsumer@" + getUri() + ":" + consumerId),
@@ -443,7 +458,7 @@ public class InMemStorage implements DataAccessorFactory {
                   killSwitch.set(true);
                 }
               }
-            } catch (Throwable ex) {
+            } catch (Exception ex) {
               log.warn("Exception in onIdle", ex);
             }
           };
@@ -469,7 +484,7 @@ public class InMemStorage implements DataAccessorFactory {
               }
             } catch (Exception ex) {
               synchronized (observer) {
-                observer.onError(ex);
+                killSwitch.compareAndSet(false, !observer.onError(ex));
               }
             }
           };
@@ -545,16 +560,29 @@ public class InMemStorage implements DataAccessorFactory {
     public boolean hasExternalizableOffsets() {
       return true;
     }
+
+    @Override
+    public Factory asFactory() {
+      final EntityDescriptor entity = getEntityDescriptor();
+      final URI uri = getUri();
+      return repo -> new InMemCommitLogReader(entity, uri);
+    }
   }
 
-  private final class Reader extends AbstractStorage
-      implements RandomAccessReader, BatchLogObservable {
+  interface ReaderFactory
+      extends RandomAccessReader.Factory<Reader>, BatchLogReader.Factory<Reader> {}
 
-    @Setter private Factory<Executor> executorFactory;
-    private transient Executor executor;
+  private final class Reader extends AbstractStorage implements RandomAccessReader, BatchLogReader {
 
-    private Reader(EntityDescriptor entityDesc, URI uri) {
+    private final cz.o2.proxima.functional.Factory<ExecutorService> executorFactory;
+    private transient ExecutorService executor;
+
+    private Reader(
+        EntityDescriptor entityDesc,
+        URI uri,
+        cz.o2.proxima.functional.Factory<ExecutorService> executorFactory) {
       super(entityDesc, uri);
+      this.executorFactory = executorFactory;
     }
 
     @Override
@@ -690,6 +718,18 @@ public class InMemStorage implements DataAccessorFactory {
     }
 
     @Override
+    public ReaderFactory asFactory() {
+      final EntityDescriptor entity = getEntityDescriptor();
+      final URI uri = getUri();
+      final cz.o2.proxima.functional.Factory<ExecutorService> executorFactory =
+          this.executorFactory;
+      return repo -> {
+        Reader reader = new Reader(entity, uri, executorFactory);
+        return reader;
+      };
+    }
+
+    @Override
     public void close() {}
 
     @Override
@@ -703,67 +743,85 @@ public class InMemStorage implements DataAccessorFactory {
     }
 
     @Override
-    public void observe(
+    public cz.o2.proxima.direct.batch.ObserveHandle observe(
         List<Partition> partitions,
         List<AttributeDescriptor<?>> attributes,
         BatchLogObserver observer) {
 
+      TerminationContext terminationContext = new TerminationContext(observer);
+      observeInternal(partitions, attributes, observer, terminationContext);
+      return terminationContext.asObserveHandle();
+    }
+
+    private void observeInternal(
+        List<Partition> partitions,
+        List<AttributeDescriptor<?>> attributes,
+        BatchLogObserver observer,
+        TerminationContext terminationContext) {
+
       log.debug(
           "Batch observing {} partitions {} for attributes {}", getUri(), partitions, attributes);
       Preconditions.checkArgument(
-          partitions.size() == 1,
-          "This observable works on single partition only, got " + partitions);
+          partitions.size() == 1, "This reader works on single partition only, got " + partitions);
       String prefix = toStoragePrefix(getUri());
-      int prefixLength = prefix.length();
       executor()
-          .execute(
+          .submit(
               () -> {
                 try {
-                  Map<String, Pair<Long, byte[]>> data = getData().tailMap(prefix);
+                  final Map<String, Pair<Long, byte[]>> data = getData().tailMap(prefix);
                   synchronized (data) {
-                    for (Map.Entry<String, Pair<Long, byte[]>> e : data.entrySet()) {
-                      if (!e.getKey().startsWith(prefix)) {
-                        break;
-                      }
-                      String k = e.getKey();
-                      Pair<Long, byte[]> v = e.getValue();
-                      String[] parts = k.substring(prefixLength).split("#");
-                      String key = parts[0];
-                      String attribute = parts[1];
-                      boolean shouldContinue =
-                          getEntityDescriptor()
-                              .findAttribute(attribute, true)
-                              .flatMap(
-                                  desc ->
-                                      attributes.contains(desc)
-                                          ? Optional.of(desc)
-                                          : Optional.empty())
-                              .map(
-                                  desc ->
-                                      observer.onNext(
-                                          StreamElement.upsert(
-                                              getEntityDescriptor(),
-                                              desc,
-                                              UUID.randomUUID().toString(),
-                                              key,
-                                              attribute,
-                                              v.getFirst(),
-                                              v.getSecond()),
-                                          PARTITION))
-                              .orElse(true);
-                      if (!shouldContinue) {
+                    for (Entry<String, Pair<Long, byte[]>> e : data.entrySet()) {
+                      if (!observeElement(attributes, observer, terminationContext, prefix, e)) {
                         break;
                       }
                     }
                   }
-                  observer.onCompleted();
+                  terminationContext.finished();
                 } catch (Throwable err) {
-                  observer.onError(err);
+                  terminationContext.handleErrorCaught(
+                      err,
+                      () -> observeInternal(partitions, attributes, observer, terminationContext));
                 }
               });
     }
 
-    private Executor executor() {
+    private boolean observeElement(
+        List<AttributeDescriptor<?>> attributes,
+        BatchLogObserver observer,
+        TerminationContext terminationContext,
+        String prefix,
+        Map.Entry<String, Pair<Long, byte[]>> e) {
+
+      if (terminationContext.isCancelled()) {
+        return false;
+      }
+      if (!e.getKey().startsWith(prefix)) {
+        return false;
+      }
+      String k = e.getKey();
+      Pair<Long, byte[]> v = e.getValue();
+      String[] parts = k.substring(prefix.length()).split("#");
+      String key = parts[0];
+      String attribute = parts[1];
+      return getEntityDescriptor()
+          .findAttribute(attribute, true)
+          .filter(attributes::contains)
+          .map(
+              desc ->
+                  observer.onNext(
+                      StreamElement.upsert(
+                          getEntityDescriptor(),
+                          desc,
+                          UUID.randomUUID().toString(),
+                          key,
+                          attribute,
+                          v.getFirst(),
+                          v.getSecond()),
+                      CONTEXT))
+          .orElse(true);
+    }
+
+    private ExecutorService executor() {
       if (executor == null) {
         executor = executorFactory.apply();
       }
@@ -776,21 +834,23 @@ public class InMemStorage implements DataAccessorFactory {
     WatermarkEstimator apply(long stamp, String consumer, ConsumedOffset offset);
   }
 
-  private static class DataHolder {
-    final NavigableMap<String, Pair<Long, byte[]>> data;
-    final Map<URI, NavigableMap<Integer, InMemIngestWriter>> observers;
-    final Map<URI, WatermarkEstimatorFactory> watermarkEstimatorFactories;
+  private static class DataHolders {
+    static final Map<String, DataHolder> HOLDERS_MAP = new ConcurrentHashMap<>();
+    static final Map<URI, WatermarkEstimatorFactory> WATERMARK_ESTIMATOR_FACTORIES =
+        new ConcurrentHashMap<>();
 
-    DataHolder() {
-      this.data = Collections.synchronizedNavigableMap(new TreeMap<>());
-      this.observers = Collections.synchronizedMap(new HashMap<>());
-      this.watermarkEstimatorFactories = new ConcurrentHashMap<>();
+    static void newStorage(InMemStorage storage) {
+      HOLDERS_MAP.put(storage.getId(), new DataHolder());
     }
 
-    WatermarkEstimator getWatermarkEstimator(
+    static DataHolder get(InMemStorage storage) {
+      return Objects.requireNonNull(HOLDERS_MAP.get(storage.getId()));
+    }
+
+    static WatermarkEstimator getWatermarkEstimator(
         URI uri, long initializationWatermark, String consumerName, ConsumedOffset offset) {
 
-      return Optional.ofNullable(watermarkEstimatorFactories.get(uri))
+      return Optional.ofNullable(WATERMARK_ESTIMATOR_FACTORIES.get(uri))
           .map(f -> f.apply(initializationWatermark, consumerName, offset))
           .orElseGet(
               () ->
@@ -801,10 +861,18 @@ public class InMemStorage implements DataAccessorFactory {
                       .build());
     }
 
-    void clear() {
-      this.data.clear();
-      this.observers.clear();
-      this.watermarkEstimatorFactories.clear();
+    static void addWatermarkEstimatorFactory(URI uri, WatermarkEstimatorFactory factory) {
+      WATERMARK_ESTIMATOR_FACTORIES.put(uri, factory);
+    }
+  }
+
+  private static class DataHolder {
+    final NavigableMap<String, Pair<Long, byte[]>> data;
+    final Map<URI, NavigableMap<Integer, InMemIngestWriter>> observers;
+
+    DataHolder() {
+      this.data = Collections.synchronizedNavigableMap(new TreeMap<>());
+      this.observers = Collections.synchronizedMap(new HashMap<>());
     }
   }
 
@@ -817,31 +885,29 @@ public class InMemStorage implements DataAccessorFactory {
    */
   public static void setWatermarkEstimatorFactory(URI uri, WatermarkEstimatorFactory factory) {
     Preconditions.checkArgument(uri.getScheme().equals("inmem"), "Expected inmem URI got %s", uri);
-    holder.watermarkEstimatorFactories.put(uri, factory);
+    DataHolders.addWatermarkEstimatorFactory(uri, factory);
   }
-
-  private static final DataHolder holder = new DataHolder();
 
   private static final ScheduledExecutorService scheduler = new ScheduledThreadPoolExecutor(4);
 
+  @Getter private final String id = UUID.randomUUID().toString();
+
   public InMemStorage() {
-    // this is hackish, but working as expected
-    // that is - when we create new instance of the storage,
-    // we want the storage to be empty
-    // we should *never* be using two instances of InMemStorage
-    // simultaneously, as that would imply we are working with
-    // two repositories, which is not supported
-    holder.clear();
-    log.info("Created new empty {}", getClass().getName());
+    log.info("Created new empty {} with id {}", getClass().getName(), id);
+    DataHolders.newStorage(this);
+  }
+
+  private DataHolder holder() {
+    return DataHolders.get(this);
   }
 
   public NavigableMap<String, Pair<Long, byte[]>> getData() {
-    return holder.data;
+    return holder().data;
   }
 
   NavigableMap<Integer, InMemIngestWriter> getObservers(URI uri) {
     return Objects.requireNonNull(
-        holder.observers.get(uri), () -> String.format("Missing observer for [%s]", uri));
+        holder().observers.get(uri), () -> String.format("Missing observer for [%s]", uri));
   }
 
   @Override
@@ -854,52 +920,71 @@ public class InMemStorage implements DataAccessorFactory {
       DirectDataOperator op, EntityDescriptor entity, URI uri, Map<String, Object> cfg) {
 
     log.info("Creating accessor {} for URI {}", getClass(), uri);
-    holder.observers.computeIfAbsent(
-        uri, k -> Collections.synchronizedNavigableMap(new TreeMap<>()));
-    final Writer writer = new Writer(entity, uri);
-    final InMemCommitLogReader commitLogReader = new InMemCommitLogReader(entity, uri);
-    final Reader reader = new Reader(entity, uri);
-    final CachedView cachedView = new LocalCachedPartitionedView(entity, commitLogReader, writer);
+    holder()
+        .observers
+        .computeIfAbsent(uri, k -> Collections.synchronizedNavigableMap(new TreeMap<>()));
+    final Repository opRepo = op.getRepository();
+    final RepositoryFactory repositoryFactory = opRepo.asFactory();
+    final OnlineAttributeWriter.Factory<?> writerFactory = new Writer(entity, uri).asFactory();
+    final CommitLogReader.Factory<?> commitLogReaderFactory =
+        new InMemCommitLogReader(entity, uri).asFactory();
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    final ReaderFactory readerFactory =
+        new Reader(entity, uri, (Factory) op.getContext().getExecutorFactory()).asFactory();
+    final CachedView.Factory cachedViewFactory =
+        new LocalCachedPartitionedView(
+                entity, commitLogReaderFactory.apply(opRepo), writerFactory.apply(opRepo))
+            .asFactory();
 
     return new DataAccessor() {
 
       private static final long serialVersionUID = 1L;
 
+      private transient @Nullable Repository repo = opRepo;
+
+      @Override
+      public URI getUri() {
+        return uri;
+      }
+
       @Override
       public Optional<AttributeWriterBase> getWriter(Context context) {
         Objects.requireNonNull(context);
-        return Optional.of(writer);
+        return Optional.of(writerFactory.apply(repo()));
       }
 
       @Override
       public Optional<CommitLogReader> getCommitLogReader(Context context) {
         Objects.requireNonNull(context);
-        return Optional.of(commitLogReader);
+        return Optional.of(commitLogReaderFactory.apply(repo()));
       }
 
       @Override
       public Optional<RandomAccessReader> getRandomAccessReader(Context context) {
         Objects.requireNonNull(context);
-        return Optional.of(reader);
+        return Optional.of(readerFactory.apply(repo()));
       }
 
       @Override
       public Optional<CachedView> getCachedView(Context context) {
         Objects.requireNonNull(context);
-        return Optional.of(cachedView);
+        return Optional.of(cachedViewFactory.apply(repo()));
       }
 
       @Override
-      public Optional<BatchLogObservable> getBatchLogObservable(Context context) {
+      public Optional<BatchLogReader> getBatchLogReader(Context context) {
         Objects.requireNonNull(context);
-        reader.setExecutorFactory(asExecutorFactory(context));
-        return Optional.of(reader);
+        Reader createdReader = readerFactory.apply(repo());
+        return Optional.of(createdReader);
+      }
+
+      private Repository repo() {
+        if (this.repo == null) {
+          this.repo = repositoryFactory.apply();
+        }
+        return this.repo;
       }
     };
-  }
-
-  private static Factory<Executor> asExecutorFactory(Context context) {
-    return context::getExecutorService;
   }
 
   @SuppressWarnings("unchecked")

@@ -25,12 +25,12 @@ import cz.o2.proxima.direct.commitlog.LogObserver;
 import cz.o2.proxima.direct.commitlog.ObserveHandle;
 import cz.o2.proxima.direct.commitlog.Offset;
 import cz.o2.proxima.direct.core.Context;
-import cz.o2.proxima.direct.core.Partition;
 import cz.o2.proxima.direct.kafka.Consumers.BulkConsumer;
 import cz.o2.proxima.direct.kafka.Consumers.OnlineConsumer;
 import cz.o2.proxima.direct.time.MinimalPartitionWatermarkEstimator;
 import cz.o2.proxima.functional.BiConsumer;
 import cz.o2.proxima.storage.AbstractStorage;
+import cz.o2.proxima.storage.Partition;
 import cz.o2.proxima.storage.StreamElement;
 import cz.o2.proxima.storage.commitlog.Position;
 import cz.o2.proxima.time.PartitionedWatermarkEstimator;
@@ -72,7 +72,7 @@ import org.apache.kafka.common.TopicPartition;
 public class KafkaLogReader extends AbstractStorage implements CommitLogReader {
 
   @Getter final KafkaAccessor accessor;
-  private final Context context;
+  @Getter private final Context context;
   private final long consumerPollInterval;
   private final long maxBytesPerSec;
   private final String topic;
@@ -620,7 +620,6 @@ public class KafkaLogReader extends AbstractStorage implements CommitLogReader {
 
   /** Create kafka consumer for the data. */
   @VisibleForTesting
-  @SuppressWarnings("unchecked")
   KafkaConsumer<Object, Object> createConsumer(
       @Nullable String name,
       @Nullable Collection<Offset> offsets,
@@ -650,7 +649,9 @@ public class KafkaLogReader extends AbstractStorage implements CommitLogReader {
       // seek all partitions to oldest data
       if (offsets == null) {
         if (consumer.assignment().isEmpty()) {
-          consumer.poll(Duration.ZERO);
+          // If we don't find assignment within timeout, poll results in IllegalStateException.
+          // https://cwiki.apache.org/confluence/display/KAFKA/KIP-266%3A+Fix+consumer+indefinite+blocking+behavior
+          consumer.poll(Duration.ofMillis(accessor.getAssignmentTimeoutMillis()));
         }
         Set<TopicPartition> assignment = consumer.assignment();
         log.info("Seeking consumer name {} to beginning of partitions {}", name, assignment);
@@ -686,6 +687,13 @@ public class KafkaLogReader extends AbstractStorage implements CommitLogReader {
   @Override
   public boolean hasExternalizableOffsets() {
     return true;
+  }
+
+  @Override
+  public Factory asFactory() {
+    final KafkaAccessor accessor = this.accessor;
+    final Context context = this.context;
+    return repo -> new KafkaLogReader(accessor, context);
   }
 
   private static Collection<Offset> createDefaultOffsets(Collection<Partition> partitions) {

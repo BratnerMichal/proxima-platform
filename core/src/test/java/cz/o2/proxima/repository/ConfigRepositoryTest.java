@@ -15,11 +15,7 @@
  */
 package cz.o2.proxima.repository;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.fail;
+import static org.junit.Assert.*;
 
 import com.google.common.collect.Iterables;
 import com.typesafe.config.Config;
@@ -44,7 +40,9 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
+import javax.annotation.Nullable;
 import lombok.extern.slf4j.Slf4j;
+import org.junit.After;
 import org.junit.Test;
 
 /** Test repository config parsing. */
@@ -57,6 +55,11 @@ public class ConfigRepositoryTest {
                   .withFallback(ConfigFactory.load("test-reference.conf"))
                   .resolve())
           .build();
+
+  @After
+  public void tearDown() {
+    ConfigRepository.dropCached();
+  }
 
   @Test
   public void testConfigParsing() {
@@ -85,13 +88,13 @@ public class ConfigRepositoryTest {
 
     // check that we can query all families
     repo.getAllFamilies()
-        .forEach(family -> assertTrue(repo.getFamilyByName(family.getName()).isPresent()));
+        .forEach(family -> assertTrue(repo.findFamilyByName(family.getName()).isPresent()));
     assertFalse(
         repo.getAllFamilies()
             .filter(af -> af.getName().equals("proxy-event-storage"))
             .findAny()
             .isPresent());
-    assertTrue(repo.getFamilyByName("proxy-event-storage").isPresent());
+    assertTrue(repo.findFamilyByName("proxy-event-storage").isPresent());
   }
 
   @Test(expected = IllegalArgumentException.class)
@@ -130,6 +133,20 @@ public class ConfigRepositoryTest {
   public void testRepositorySerializable() throws Exception {
     ConfigRepository clone = TestUtils.assertSerializable(repo);
     assertTrue(clone == repo);
+  }
+
+  @Test
+  public void testConstructionSerializable() throws IOException, ClassNotFoundException {
+    Repository repo = Repository.of(ConfigFactory.load("test-reference.conf").resolve());
+    TestUtils.assertSerializable(repo);
+  }
+
+  @Test
+  public void testBuilderSerializable() throws IOException, ClassNotFoundException {
+    ConfigRepository repo = Builder.of(ConfigFactory.load("test-reference.conf").resolve()).build();
+    TestUtils.assertSerializable(repo);
+    repo = Builder.ofTest(ConfigFactory.load("test-reference.conf").resolve()).build();
+    TestUtils.assertSerializable(repo);
   }
 
   @Test
@@ -424,20 +441,6 @@ public class ConfigRepositoryTest {
     }
   }
 
-  @Test
-  public void testDeprecatedConstructionSerializable() throws IOException, ClassNotFoundException {
-    Repository repo = Repository.of(ConfigFactory.load("test-reference.conf").resolve());
-    TestUtils.assertSerializable(repo);
-  }
-
-  @Test
-  public void testBuilderSerializable() throws IOException, ClassNotFoundException {
-    ConfigRepository repo = Builder.of(ConfigFactory.load("test-reference.conf").resolve()).build();
-    TestUtils.assertSerializable(repo);
-    repo = Builder.ofTest(ConfigFactory.load("test-reference.conf").resolve()).build();
-    TestUtils.assertSerializable(repo);
-  }
-
   @Test(expected = IllegalStateException.class)
   public void testMultipleInstancesThrowException() {
     Builder.of(ConfigFactory.load("test-reference.conf").resolve()).build();
@@ -512,12 +515,68 @@ public class ConfigRepositoryTest {
     assertEquals(flag, Validate.ALL.getFlag());
   }
 
+  @Test
+  public void testAsFactoryCreatesSameRepository() {
+    RepositoryFactory factory = repo.asFactory();
+    Config newCfg = ConfigFactory.parseString("dummy = 1").withFallback(repo.getConfig());
+    ConfigRepository.dropCached();
+    ConfigRepository updated = ConfigRepository.Builder.of(newCfg).build();
+    RepositoryFactory newFactory = updated.asFactory();
+    assertTrue(factory instanceof RepositoryFactory.VersionedCaching);
+    assertTrue(newFactory instanceof RepositoryFactory.VersionedCaching);
+    RepositoryFactory.VersionedCaching.drop();
+
+    Repository oldRepo = factory.apply();
+    assertNotSame(repo, oldRepo);
+    assertEquals(repo, oldRepo);
+    assertSame(oldRepo, oldRepo.asFactory().apply());
+
+    ConfigRepository newRepo = (ConfigRepository) newFactory.apply();
+    assertNotSame(updated, newRepo);
+    assertEquals(updated, newRepo);
+    assertSame(newRepo.asFactory().apply(), newRepo);
+    assertSame(factory.apply(), newRepo);
+  }
+
+  @Test
+  public void testRepositoryDrop() {
+    Repository cloned = repo.asFactory().apply();
+    assertSame(cloned, repo);
+    repo.drop();
+    cloned = repo.asFactory().apply();
+    assertNotSame(cloned, repo);
+  }
+
+  @Test
+  public void testTestRepositoryDrop() {
+    Repository first = Repository.ofTest(ConfigFactory.load("test-reference.conf").resolve());
+    Repository second = first.asFactory().apply();
+    assertSame(second, first);
+    first.drop();
+    second = first.asFactory().apply();
+    assertNotSame(second, first);
+  }
+
+  @Test
+  public void testFindFamilyByName() {
+    assertFalse(repo.findFamilyByName("not-found").isPresent());
+    assertTrue(repo.findFamilyByName("event-storage-stream").isPresent());
+    assertNotNull(repo.getFamilyByName("event-storage-stream"));
+    checkThrows(() -> repo.getFamilyByName("not-found"), IllegalArgumentException.class);
+  }
+
   private void checkThrows(Factory<?> factory) {
+    checkThrows(factory, null);
+  }
+
+  private void checkThrows(Factory<?> factory, @Nullable Class<? extends Throwable> cls) {
     try {
       factory.apply();
       fail("Expression should have thrown exception");
     } catch (Exception err) {
-      // pass
+      assertTrue(
+          "Exception " + err.getClass() + " is not " + cls,
+          cls == null || err.getClass().isAssignableFrom(cls));
     }
   }
 

@@ -24,8 +24,8 @@ import cz.o2.proxima.direct.commitlog.ObserveHandle;
 import cz.o2.proxima.direct.commitlog.ObserverUtils;
 import cz.o2.proxima.direct.commitlog.Offset;
 import cz.o2.proxima.direct.core.Context;
-import cz.o2.proxima.direct.core.Partition;
 import cz.o2.proxima.functional.BiConsumer;
+import cz.o2.proxima.storage.Partition;
 import cz.o2.proxima.storage.StreamElement;
 import cz.o2.proxima.storage.commitlog.Position;
 import java.net.URI;
@@ -195,6 +195,13 @@ public class ListCommitLog implements CommitLogReader {
   public ObserveHandle observeBulkOffsets(Collection<Offset> offsets, LogObserver observer) {
 
     return observeBulk(null, null, observer);
+  }
+
+  @Override
+  public Factory asFactory() {
+    final List<StreamElement> data = this.data;
+    final Context context = this.context;
+    return repo -> new ListCommitLog(data, context);
   }
 
   private void pushTo(BiConsumer<StreamElement, Integer> consumer, Runnable finish) {

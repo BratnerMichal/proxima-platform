@@ -16,8 +16,8 @@
 package cz.o2.proxima.direct.core;
 
 import com.google.common.base.Preconditions;
-import cz.o2.proxima.direct.batch.BatchLogObservable;
 import cz.o2.proxima.direct.batch.BatchLogObserver;
+import cz.o2.proxima.direct.batch.BatchLogReader;
 import cz.o2.proxima.direct.commitlog.CommitLogReader;
 import cz.o2.proxima.direct.commitlog.LogObserver;
 import cz.o2.proxima.direct.commitlog.ObserveHandle;
@@ -34,6 +34,8 @@ import cz.o2.proxima.repository.AttributeDescriptor;
 import cz.o2.proxima.repository.AttributeFamilyProxyDescriptor;
 import cz.o2.proxima.repository.AttributeProxyDescriptor;
 import cz.o2.proxima.repository.EntityDescriptor;
+import cz.o2.proxima.repository.Repository;
+import cz.o2.proxima.storage.Partition;
 import cz.o2.proxima.storage.StreamElement;
 import cz.o2.proxima.storage.commitlog.Position;
 import cz.o2.proxima.transform.ProxyTransform;
@@ -41,7 +43,6 @@ import cz.o2.proxima.util.Pair;
 import java.io.IOException;
 import java.io.Serializable;
 import java.net.URI;
-import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
@@ -59,9 +60,9 @@ public class DirectAttributeFamilyProxyDescriptor extends DirectAttributeFamilyD
   private static final long serialVersionUID = 1L;
 
   static DirectAttributeFamilyProxyDescriptor of(
-      Context context, AttributeFamilyProxyDescriptor proxy) {
+      Repository repo, Context context, AttributeFamilyProxyDescriptor proxy) {
 
-    return new DirectAttributeFamilyProxyDescriptor(context, proxy, new AttrLookup(proxy));
+    return new DirectAttributeFamilyProxyDescriptor(repo, context, proxy, new AttrLookup(proxy));
   }
 
   static class AttrLookup implements Serializable {
@@ -107,7 +108,7 @@ public class DirectAttributeFamilyProxyDescriptor extends DirectAttributeFamilyD
             name,
             familyName);
         try {
-          return Arrays.asList(lookupProxy(name));
+          return Collections.singletonList(lookupProxy(name));
         } catch (Exception ex) {
           log.warn(
               "Error during lookup of {} in family {}." + "This might indicate serious problem.",
@@ -139,14 +140,24 @@ public class DirectAttributeFamilyProxyDescriptor extends DirectAttributeFamilyD
     }
   }
 
+  private static Optional<CommitLogReader> getCommitLogReader(
+      AttrLookup lookup, Context context, AttributeFamilyProxyDescriptor desc) {
+
+    return context
+        .resolve(desc.getTargetFamilyRead())
+        .flatMap(DirectAttributeFamilyDescriptor::getCommitLogReader)
+        .map(reader -> new ProxyCommitLogReader(reader, lookup));
+  }
+
   DirectAttributeFamilyProxyDescriptor(
-      Context context, AttributeFamilyProxyDescriptor desc, AttrLookup lookup) {
+      Repository repo, Context context, AttributeFamilyProxyDescriptor desc, AttrLookup lookup) {
 
     super(
+        repo,
         desc,
         getWriter(lookup, context, desc),
         getCommitLogReader(lookup, context, desc),
-        getBatchObservable(lookup, context, desc),
+        getBatchReader(lookup, context, desc),
         getRandomAccess(lookup, context, desc),
         getPartitionedCachedView(lookup, context, desc));
   }
@@ -164,165 +175,16 @@ public class DirectAttributeFamilyProxyDescriptor extends DirectAttributeFamilyD
       return Optional.empty();
     }
     OnlineAttributeWriter writer = w.get().online();
-    return Optional.of(
-        new OnlineAttributeWriter() {
-
-          @Override
-          public void rollback() {
-            writer.rollback();
-          }
-
-          @Override
-          public void write(StreamElement data, CommitCallback statusCallback) {
-            AttributeProxyDescriptor<?> target =
-                lookup.lookupProxy(data.getAttributeDescriptor().getName());
-
-            log.debug(
-                "proxying write of {} to target {} using writer {}", data, target, writer.getUri());
-
-            writer.write(transformToRaw(data, target), statusCallback);
-          }
-
-          @Override
-          public URI getUri() {
-            return uri;
-          }
-
-          @Override
-          public void close() {
-            writer.close();
-          }
-        });
+    return Optional.of(new ProxyOnlineAttributeWriter(writer, lookup, uri));
   }
 
-  private static Optional<CommitLogReader> getCommitLogReader(
+  private static Optional<BatchLogReader> getBatchReader(
       AttrLookup lookup, Context context, AttributeFamilyProxyDescriptor desc) {
 
     return context
         .resolve(desc.getTargetFamilyRead())
-        .flatMap(DirectAttributeFamilyDescriptor::getCommitLogReader)
-        .map(
-            reader ->
-                new CommitLogReader() {
-
-                  @Override
-                  public URI getUri() {
-                    return reader.getUri();
-                  }
-
-                  @Override
-                  public List<Partition> getPartitions() {
-                    return reader.getPartitions();
-                  }
-
-                  @Override
-                  public ObserveHandle observe(
-                      String name, Position position, LogObserver observer) {
-
-                    return reader.observe(name, position, wrapTransformed(lookup, observer));
-                  }
-
-                  @Override
-                  public ObserveHandle observePartitions(
-                      String name,
-                      Collection<Partition> partitions,
-                      Position position,
-                      boolean stopAtCurrent,
-                      LogObserver observer) {
-
-                    return reader.observePartitions(
-                        name,
-                        partitions,
-                        position,
-                        stopAtCurrent,
-                        wrapTransformed(lookup, observer));
-                  }
-
-                  @Override
-                  public ObserveHandle observePartitions(
-                      Collection<Partition> partitions,
-                      Position position,
-                      boolean stopAtCurrent,
-                      LogObserver observer) {
-
-                    return reader.observePartitions(
-                        partitions, position, stopAtCurrent, wrapTransformed(lookup, observer));
-                  }
-
-                  @Override
-                  public ObserveHandle observeBulk(
-                      String name, Position position, boolean stopAtCurrent, LogObserver observer) {
-
-                    return reader.observeBulk(
-                        name, position, stopAtCurrent, wrapTransformed(lookup, observer));
-                  }
-
-                  @Override
-                  public ObserveHandle observeBulkPartitions(
-                      Collection<Partition> partitions,
-                      Position position,
-                      boolean stopAtCurrent,
-                      LogObserver observer) {
-
-                    return reader.observeBulkPartitions(
-                        partitions, position, stopAtCurrent, wrapTransformed(lookup, observer));
-                  }
-
-                  @Override
-                  public ObserveHandle observeBulkPartitions(
-                      String name,
-                      Collection<Partition> partitions,
-                      Position position,
-                      boolean stopAtCurrent,
-                      LogObserver observer) {
-
-                    return reader.observeBulkPartitions(
-                        name,
-                        partitions,
-                        position,
-                        stopAtCurrent,
-                        wrapTransformed(lookup, observer));
-                  }
-
-                  @Override
-                  public ObserveHandle observeBulkOffsets(
-                      Collection<Offset> offsets, LogObserver observer) {
-
-                    return reader.observeBulkOffsets(offsets, wrapTransformed(lookup, observer));
-                  }
-                });
-  }
-
-  private static Optional<BatchLogObservable> getBatchObservable(
-      AttrLookup lookup, Context context, AttributeFamilyProxyDescriptor desc) {
-
-    return context
-        .resolve(desc.getTargetFamilyRead())
-        .flatMap(DirectAttributeFamilyDescriptor::getBatchObservable)
-        .map(
-            reader ->
-                new BatchLogObservable() {
-
-                  @Override
-                  public List<Partition> getPartitions(long startStamp, long endStamp) {
-                    return reader.getPartitions(startStamp, endStamp);
-                  }
-
-                  @Override
-                  public void observe(
-                      List<Partition> partitions,
-                      List<AttributeDescriptor<?>> attributes,
-                      BatchLogObserver observer) {
-
-                    reader.observe(
-                        partitions,
-                        attributes
-                            .stream()
-                            .map(a -> lookup.lookupProxy(a.getName()))
-                            .collect(Collectors.toList()),
-                        wrapTransformed(lookup, observer));
-                  }
-                });
+        .flatMap(DirectAttributeFamilyDescriptor::getBatchReader)
+        .map(reader -> new ProxyBatchLogReader(reader, lookup));
   }
 
   @SuppressWarnings("unchecked")
@@ -332,112 +194,7 @@ public class DirectAttributeFamilyProxyDescriptor extends DirectAttributeFamilyD
     return context
         .resolve(desc.getTargetFamilyRead())
         .flatMap(DirectAttributeFamilyDescriptor::getRandomAccessReader)
-        .map(
-            reader ->
-                new RandomAccessReader() {
-
-                  @Override
-                  public RandomOffset fetchOffset(RandomAccessReader.Listing type, String key) {
-
-                    if (type == RandomAccessReader.Listing.ATTRIBUTE && !key.isEmpty()) {
-                      return reader.fetchOffset(
-                          type,
-                          lookup
-                              .lookupProxy(toAttrName(key))
-                              .getReadTransform()
-                              .asElementWise()
-                              .fromProxy(key));
-                    }
-                    return reader.fetchOffset(type, key);
-                  }
-
-                  @SuppressWarnings("unchecked")
-                  @Override
-                  public <T> Optional<KeyValue<T>> get(
-                      String key, String attribute, AttributeDescriptor<T> desc, long stamp) {
-
-                    AttributeProxyDescriptor<T> targetAttribute;
-                    targetAttribute =
-                        (AttributeProxyDescriptor<T>) lookup.lookupProxy(desc.getName());
-                    ProxyTransform transform = targetAttribute.getReadTransform();
-                    return reader
-                        .get(
-                            key,
-                            transform.asElementWise().fromProxy(attribute),
-                            targetAttribute.getReadTarget(),
-                            stamp)
-                        .map(kv -> transformKvToProxy(kv, targetAttribute));
-                  }
-
-                  @SuppressWarnings("unchecked")
-                  @Override
-                  public <T> void scanWildcard(
-                      String key,
-                      AttributeDescriptor<T> wildcard,
-                      RandomOffset offset,
-                      long stamp,
-                      int limit,
-                      Consumer<KeyValue<T>> consumer) {
-
-                    AttributeProxyDescriptor<?> targetAttribute =
-                        lookup.lookupProxy(wildcard.getName());
-                    if (!targetAttribute.isWildcard()) {
-                      throw new IllegalArgumentException("Proxy target is not wildcard attribute!");
-                    }
-                    Preconditions.checkArgument(
-                        offset == null || offset instanceof RawOffset,
-                        "Scanning through proxy can be done with RawOffests only, got %s",
-                        offset);
-                    reader.scanWildcard(
-                        key,
-                        targetAttribute.getReadTarget(),
-                        offset,
-                        stamp,
-                        limit,
-                        kv -> consumer.accept(transformKvToProxy((KeyValue) kv, targetAttribute)));
-                  }
-
-                  @Override
-                  public void scanWildcardAll(
-                      String key,
-                      RandomOffset offset,
-                      long stamp,
-                      int limit,
-                      Consumer<KeyValue<?>> consumer) {
-
-                    reader.scanWildcardAll(
-                        key,
-                        offset,
-                        stamp,
-                        limit,
-                        kv ->
-                            lookup
-                                .lookupRead(kv.getAttributeDescriptor().getName())
-                                .stream()
-                                .forEach(
-                                    attr ->
-                                        consumer.accept(transformKvToProxy((KeyValue) kv, attr))));
-                  }
-
-                  @Override
-                  public void listEntities(
-                      RandomOffset offset,
-                      int limit,
-                      Consumer<Pair<RandomOffset, String>> consumer) {
-
-                    reader.listEntities(offset, limit, consumer);
-                  }
-
-                  @Override
-                  public void close() throws IOException {
-                    reader.close();
-                  }
-
-                  @Override
-                  public EntityDescriptor getEntityDescriptor() {
-                    return reader.getEntityDescriptor();
-                  }
-                });
+        .map(reader -> new ProxyRandomAccessReader(reader, lookup));
   }
 
   private static Optional<CachedView> getPartitionedCachedView(
@@ -513,13 +270,13 @@ public class DirectAttributeFamilyProxyDescriptor extends DirectAttributeFamilyD
     return new BatchLogObserver() {
 
       @Override
-      public boolean onNext(StreamElement ingest, Partition partition) {
+      public boolean onNext(StreamElement ingest, OnNextContext context) {
 
         try {
           return lookup
               .lookupRead(ingest.getAttributeDescriptor().getName())
               .stream()
-              .map(attr -> observer.onNext(transformToProxy(ingest, attr), partition))
+              .map(attr -> observer.onNext(transformToProxy(ingest, attr), context))
               .filter(c -> !c)
               .findFirst()
               .orElse(true);
@@ -537,6 +294,11 @@ public class DirectAttributeFamilyProxyDescriptor extends DirectAttributeFamilyD
       @Override
       public boolean onError(Throwable error) {
         return observer.onError(error);
+      }
+
+      @Override
+      public void onCancelled() {
+        observer.onCancelled();
       }
     };
   }
@@ -620,5 +382,288 @@ public class DirectAttributeFamilyProxyDescriptor extends DirectAttributeFamilyD
       return key.substring(0, index) + ".*";
     }
     return key;
+  }
+
+  private static class ProxyOnlineAttributeWriter implements OnlineAttributeWriter {
+
+    private final OnlineAttributeWriter writer;
+    private final AttrLookup lookup;
+    private final URI uri;
+
+    public ProxyOnlineAttributeWriter(OnlineAttributeWriter writer, AttrLookup lookup, URI uri) {
+      this.writer = writer;
+      this.lookup = lookup;
+      this.uri = uri;
+    }
+
+    @Override
+    public void rollback() {
+      writer.rollback();
+    }
+
+    @Override
+    public void write(StreamElement data, CommitCallback statusCallback) {
+      AttributeProxyDescriptor<?> target =
+          lookup.lookupProxy(data.getAttributeDescriptor().getName());
+
+      log.debug("proxying write of {} to target {} using writer {}", data, target, writer.getUri());
+
+      writer.write(transformToRaw(data, target), statusCallback);
+    }
+
+    @Override
+    public Factory<?> asFactory() {
+      final Factory<?> writerFactory = writer.asFactory();
+      final AttrLookup lookup = this.lookup;
+      final URI uri = this.uri;
+      return repo -> new ProxyOnlineAttributeWriter(writerFactory.apply(repo), lookup, uri);
+    }
+
+    @Override
+    public URI getUri() {
+      return uri;
+    }
+
+    @Override
+    public void close() {
+      writer.close();
+    }
+  }
+
+  private static class ProxyCommitLogReader implements CommitLogReader {
+
+    private final CommitLogReader reader;
+    private final AttrLookup lookup;
+
+    public ProxyCommitLogReader(CommitLogReader reader, AttrLookup lookup) {
+      this.reader = reader;
+      this.lookup = lookup;
+    }
+
+    @Override
+    public URI getUri() {
+      return reader.getUri();
+    }
+
+    @Override
+    public List<Partition> getPartitions() {
+      return reader.getPartitions();
+    }
+
+    @Override
+    public ObserveHandle observe(String name, Position position, LogObserver observer) {
+
+      return reader.observe(name, position, wrapTransformed(lookup, observer));
+    }
+
+    @Override
+    public ObserveHandle observePartitions(
+        String name,
+        Collection<Partition> partitions,
+        Position position,
+        boolean stopAtCurrent,
+        LogObserver observer) {
+
+      return reader.observePartitions(
+          name, partitions, position, stopAtCurrent, wrapTransformed(lookup, observer));
+    }
+
+    @Override
+    public ObserveHandle observePartitions(
+        Collection<Partition> partitions,
+        Position position,
+        boolean stopAtCurrent,
+        LogObserver observer) {
+
+      return reader.observePartitions(
+          partitions, position, stopAtCurrent, wrapTransformed(lookup, observer));
+    }
+
+    @Override
+    public ObserveHandle observeBulk(
+        String name, Position position, boolean stopAtCurrent, LogObserver observer) {
+
+      return reader.observeBulk(name, position, stopAtCurrent, wrapTransformed(lookup, observer));
+    }
+
+    @Override
+    public ObserveHandle observeBulkPartitions(
+        Collection<Partition> partitions,
+        Position position,
+        boolean stopAtCurrent,
+        LogObserver observer) {
+
+      return reader.observeBulkPartitions(
+          partitions, position, stopAtCurrent, wrapTransformed(lookup, observer));
+    }
+
+    @Override
+    public ObserveHandle observeBulkPartitions(
+        String name,
+        Collection<Partition> partitions,
+        Position position,
+        boolean stopAtCurrent,
+        LogObserver observer) {
+
+      return reader.observeBulkPartitions(
+          name, partitions, position, stopAtCurrent, wrapTransformed(lookup, observer));
+    }
+
+    @Override
+    public ObserveHandle observeBulkOffsets(Collection<Offset> offsets, LogObserver observer) {
+
+      return reader.observeBulkOffsets(offsets, wrapTransformed(lookup, observer));
+    }
+
+    @Override
+    public Factory<?> asFactory() {
+      final Factory<?> readerFactory = reader.asFactory();
+      final AttrLookup lookup = this.lookup;
+      return repo -> new ProxyCommitLogReader(readerFactory.apply(repo), lookup);
+    }
+  }
+
+  private static class ProxyRandomAccessReader implements RandomAccessReader {
+
+    private final RandomAccessReader reader;
+    private final AttrLookup lookup;
+
+    public ProxyRandomAccessReader(RandomAccessReader reader, AttrLookup lookup) {
+      this.reader = reader;
+      this.lookup = lookup;
+    }
+
+    @Override
+    public RandomOffset fetchOffset(Listing type, String key) {
+
+      if (type == Listing.ATTRIBUTE && !key.isEmpty()) {
+        return reader.fetchOffset(
+            type,
+            lookup.lookupProxy(toAttrName(key)).getReadTransform().asElementWise().fromProxy(key));
+      }
+      return reader.fetchOffset(type, key);
+    }
+
+    @SuppressWarnings("unchecked")
+    @Override
+    public <T> Optional<KeyValue<T>> get(
+        String key, String attribute, AttributeDescriptor<T> desc, long stamp) {
+
+      AttributeProxyDescriptor<T> targetAttribute;
+      targetAttribute = (AttributeProxyDescriptor<T>) lookup.lookupProxy(desc.getName());
+      ProxyTransform transform = targetAttribute.getReadTransform();
+      return reader
+          .get(
+              key,
+              transform.asElementWise().fromProxy(attribute),
+              targetAttribute.getReadTarget(),
+              stamp)
+          .map(kv -> transformKvToProxy(kv, targetAttribute));
+    }
+
+    @SuppressWarnings("unchecked")
+    @Override
+    public <T> void scanWildcard(
+        String key,
+        AttributeDescriptor<T> wildcard,
+        RandomOffset offset,
+        long stamp,
+        int limit,
+        Consumer<KeyValue<T>> consumer) {
+
+      AttributeProxyDescriptor<?> targetAttribute = lookup.lookupProxy(wildcard.getName());
+      if (!targetAttribute.isWildcard()) {
+        throw new IllegalArgumentException("Proxy target is not wildcard attribute!");
+      }
+      Preconditions.checkArgument(
+          offset == null || offset instanceof RawOffset,
+          "Scanning through proxy can be done with RawOffests only, got %s",
+          offset);
+      reader.scanWildcard(
+          key,
+          targetAttribute.getReadTarget(),
+          offset,
+          stamp,
+          limit,
+          kv -> consumer.accept(transformKvToProxy((KeyValue) kv, targetAttribute)));
+    }
+
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    @Override
+    public void scanWildcardAll(
+        String key, RandomOffset offset, long stamp, int limit, Consumer<KeyValue<?>> consumer) {
+
+      reader.scanWildcardAll(
+          key,
+          offset,
+          stamp,
+          limit,
+          kv ->
+              lookup
+                  .lookupRead(kv.getAttributeDescriptor().getName())
+                  .forEach(attr -> consumer.accept(transformKvToProxy((KeyValue) kv, attr))));
+    }
+
+    @Override
+    public void listEntities(
+        RandomOffset offset, int limit, Consumer<Pair<RandomOffset, String>> consumer) {
+
+      reader.listEntities(offset, limit, consumer);
+    }
+
+    @Override
+    public void close() throws IOException {
+      reader.close();
+    }
+
+    @Override
+    public EntityDescriptor getEntityDescriptor() {
+      return reader.getEntityDescriptor();
+    }
+
+    @Override
+    public Factory<?> asFactory() {
+      final Factory<?> readerFactory = reader.asFactory();
+      final AttrLookup lookup = this.lookup;
+      return repo -> new ProxyRandomAccessReader(readerFactory.apply(repo), lookup);
+    }
+  }
+
+  private static class ProxyBatchLogReader implements BatchLogReader {
+
+    private final BatchLogReader reader;
+    private final AttrLookup lookup;
+
+    public ProxyBatchLogReader(BatchLogReader reader, AttrLookup lookup) {
+      this.reader = reader;
+      this.lookup = lookup;
+    }
+
+    @Override
+    public List<Partition> getPartitions(long startStamp, long endStamp) {
+      return reader.getPartitions(startStamp, endStamp);
+    }
+
+    @Override
+    public cz.o2.proxima.direct.batch.ObserveHandle observe(
+        List<Partition> partitions,
+        List<AttributeDescriptor<?>> attributes,
+        BatchLogObserver observer) {
+
+      return reader.observe(
+          partitions,
+          attributes
+              .stream()
+              .map(a -> lookup.lookupProxy(a.getName()))
+              .collect(Collectors.toList()),
+          wrapTransformed(lookup, observer));
+    }
+
+    @Override
+    public Factory<?> asFactory() {
+      final Factory<?> readerFactory = reader.asFactory();
+      final AttrLookup lookup = this.lookup;
+      return repo -> new ProxyBatchLogReader(readerFactory.apply(repo), lookup);
+    }
   }
 }

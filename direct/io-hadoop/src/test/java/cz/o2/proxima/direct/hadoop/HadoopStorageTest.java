@@ -20,17 +20,18 @@ import static org.junit.Assert.*;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Iterables;
 import com.typesafe.config.ConfigFactory;
-import cz.o2.proxima.direct.batch.BatchLogObservable;
 import cz.o2.proxima.direct.batch.BatchLogObserver;
+import cz.o2.proxima.direct.batch.BatchLogReader;
+import cz.o2.proxima.direct.batch.ObserveHandle;
 import cz.o2.proxima.direct.core.AttributeWriterBase;
 import cz.o2.proxima.direct.core.BulkAttributeWriter;
 import cz.o2.proxima.direct.core.CommitCallback;
 import cz.o2.proxima.direct.core.DirectDataOperator;
-import cz.o2.proxima.direct.core.Partition;
 import cz.o2.proxima.repository.AttributeDescriptor;
 import cz.o2.proxima.repository.ConfigRepository;
 import cz.o2.proxima.repository.EntityDescriptor;
 import cz.o2.proxima.repository.Repository;
+import cz.o2.proxima.storage.Partition;
 import cz.o2.proxima.storage.StreamElement;
 import cz.o2.proxima.storage.internal.AbstractDataAccessorFactory.Accept;
 import cz.o2.proxima.util.ExceptionUtils;
@@ -49,6 +50,8 @@ import java.util.UUID;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.SynchronousQueue;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import lombok.extern.slf4j.Slf4j;
 import org.junit.Before;
 import org.junit.Rule;
@@ -137,11 +140,11 @@ public class HadoopStorageTest {
     BulkAttributeWriter writer =
         writeOneElement(
             accessor,
-            ((success, error) -> {
+            (success, error) -> {
               assertTrue(success);
               assertNull(error);
               latch.countDown();
-            }));
+            });
     writer.updateWatermark(Long.MAX_VALUE);
     latch.await();
     assertTrue(root.exists());
@@ -149,7 +152,7 @@ public class HadoopStorageTest {
     assertEquals("Expected single file in " + files, 1, files.size());
     assertFalse(Iterables.getOnlyElement(files).getAbsolutePath().contains("_tmp"));
 
-    BatchLogObservable reader = accessor.getBatchLogObservable(direct.getContext()).orElse(null);
+    BatchLogReader reader = accessor.getBatchLogReader(direct.getContext()).orElse(null);
     assertNotNull(reader);
     List<Partition> partitions = reader.getPartitions();
     assertEquals(1, partitions.size());
@@ -166,6 +169,105 @@ public class HadoopStorageTest {
         });
     StreamElement element = queue.take();
     assertNotNull(element);
+  }
+
+  @Test(timeout = 5000L)
+  public void testObserveCancel() throws InterruptedException {
+    Map<String, Object> cfg = cfg(HadoopDataAccessor.HADOOP_ROLL_INTERVAL, -1);
+    HadoopDataAccessor accessor = new HadoopDataAccessor(entity, uri, cfg);
+
+    CountDownLatch latch = new CountDownLatch(1);
+    writeOneElement(
+            accessor,
+            (success, error) -> {
+              assertTrue(success);
+              assertNull(error);
+              latch.countDown();
+            })
+        .updateWatermark(Long.MAX_VALUE);
+    latch.await();
+    BatchLogReader reader = accessor.getBatchLogReader(direct.getContext()).orElse(null);
+    assertNotNull(reader);
+    List<Partition> partitions = reader.getPartitions();
+    assertEquals(1, partitions.size());
+    CountDownLatch cancelledLatch = new CountDownLatch(1);
+    AtomicReference<ObserveHandle> handle = new AtomicReference<>();
+    handle.set(
+        reader.observe(
+            partitions,
+            Collections.singletonList(attribute),
+            new BatchLogObserver() {
+              @Override
+              public boolean onNext(StreamElement element) {
+                handle.get().close();
+                return true;
+              }
+
+              @Override
+              public void onCompleted() {
+                fail("onCompleted should not have been called");
+              }
+
+              @Override
+              public void onCancelled() {
+                cancelledLatch.countDown();
+              }
+
+              @Override
+              public boolean onError(Throwable error) {
+                onCancelled();
+                return true;
+              }
+            }));
+    cancelledLatch.await();
+  }
+
+  @Test(timeout = 5000L)
+  public void testOnNextCancel() throws InterruptedException {
+    Map<String, Object> cfg = cfg(HadoopDataAccessor.HADOOP_ROLL_INTERVAL, -1);
+    HadoopDataAccessor accessor = new HadoopDataAccessor(entity, uri, cfg);
+
+    long now = System.currentTimeMillis();
+    AtomicInteger consumed = new AtomicInteger();
+    CountDownLatch latch = new CountDownLatch(1);
+    write(
+            accessor,
+            (success, error) -> {
+              assertTrue(success);
+              assertNull(error);
+              latch.countDown();
+            },
+            element(now),
+            element(now + 1))
+        .updateWatermark(Long.MAX_VALUE);
+    latch.await();
+    BatchLogReader reader = accessor.getBatchLogReader(direct.getContext()).orElse(null);
+    assertNotNull(reader);
+    List<Partition> partitions = reader.getPartitions();
+    assertEquals(1, partitions.size());
+    CountDownLatch consumedLatch = new CountDownLatch(1);
+    reader.observe(
+        partitions,
+        Collections.singletonList(attribute),
+        new BatchLogObserver() {
+          @Override
+          public boolean onNext(StreamElement element) {
+            consumed.incrementAndGet();
+            return true;
+          }
+
+          @Override
+          public void onCompleted() {
+            consumedLatch.countDown();
+          }
+
+          @Override
+          public void onCancelled() {
+            fail("onCompleted should not have been called");
+          }
+        });
+    consumedLatch.await();
+    assertEquals(1, consumed.get());
   }
 
   @Test(timeout = 5000L)
@@ -191,7 +293,7 @@ public class HadoopStorageTest {
     assertEquals("Expected single file in " + files, 1, files.size());
     assertFalse(Iterables.getOnlyElement(files).getAbsolutePath().contains("_tmp"));
 
-    BatchLogObservable reader = accessor.getBatchLogObservable(direct.getContext()).orElse(null);
+    BatchLogReader reader = accessor.getBatchLogReader(direct.getContext()).orElse(null);
     assertNotNull(reader);
     List<Partition> partitions = reader.getPartitions();
     assertEquals(1, partitions.size());
@@ -232,7 +334,7 @@ public class HadoopStorageTest {
     assertEquals("Expected single file in " + files, 1, files.size());
     assertTrue(Iterables.getOnlyElement(files).getAbsolutePath().contains("_tmp"));
 
-    BatchLogObservable reader = accessor.getBatchLogObservable(direct.getContext()).orElse(null);
+    BatchLogReader reader = accessor.getBatchLogReader(direct.getContext()).orElse(null);
     assertNotNull(reader);
     List<Partition> partitions = reader.getPartitions();
     assertTrue("Expected empty partitions, got " + partitions, partitions.isEmpty());
@@ -257,6 +359,28 @@ public class HadoopStorageTest {
         });
     StreamElement element = queue.take();
     assertNotNull(element);
+  }
+
+  @Test
+  public void testWriterAsFactorySerializable() throws IOException, ClassNotFoundException {
+    HadoopDataAccessor accessor =
+        new HadoopDataAccessor(entity, URI.create("hdfs://namenode"), Collections.emptyMap());
+    HadoopBulkAttributeWriter writer = new HadoopBulkAttributeWriter(accessor, direct.getContext());
+    byte[] bytes = TestUtils.serializeObject(writer.asFactory());
+    AttributeWriterBase.Factory<?> factory = TestUtils.deserializeObject(bytes);
+    assertEquals(writer.getUri(), factory.apply(repository).getUri());
+  }
+
+  @Test
+  public void testReaderAsFactorySerializable() throws IOException, ClassNotFoundException {
+    HadoopDataAccessor accessor =
+        new HadoopDataAccessor(entity, URI.create("hdfs://namenode"), Collections.emptyMap());
+    HadoopBatchLogReader reader = new HadoopBatchLogReader(accessor, direct.getContext());
+    byte[] bytes = TestUtils.serializeObject(reader.asFactory());
+    BatchLogReader.Factory<?> factory = TestUtils.deserializeObject(bytes);
+    assertEquals(
+        accessor.getUri(),
+        ((HadoopBatchLogReader) factory.apply(repository)).getAccessor().getUri());
   }
 
   Map<String, Object> cfg(Object... kvs) {

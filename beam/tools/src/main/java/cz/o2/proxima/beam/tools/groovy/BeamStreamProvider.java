@@ -15,7 +15,9 @@
  */
 package cz.o2.proxima.beam.tools.groovy;
 
+import com.google.api.client.util.Lists;
 import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.MoreObjects;
 import com.google.common.base.Preconditions;
 import cz.o2.proxima.beam.core.BeamDataOperator;
 import cz.o2.proxima.functional.Factory;
@@ -57,6 +59,7 @@ import org.apache.beam.runners.core.construction.resources.PipelineResources;
 import org.apache.beam.runners.spark.SparkCommonPipelineOptions;
 import org.apache.beam.sdk.Pipeline;
 import org.apache.beam.sdk.PipelineRunner;
+import org.apache.beam.sdk.options.ExperimentalOptions;
 import org.apache.beam.sdk.options.PipelineOptions;
 import org.apache.beam.sdk.options.PipelineOptionsFactory;
 
@@ -86,11 +89,15 @@ public abstract class BeamStreamProvider implements StreamProvider {
       args = readAndRemoveRegistrars(args, registrars);
       super.init(repo, args);
       this.args = args;
-      log.info("Created {} arguments {}", getClass().getName(), Arrays.toString(args));
       runner = System.getenv("RUNNER");
+      log.info(
+          "Created {} with arguments {} and env RUNNER {}",
+          getClass().getName(),
+          Arrays.toString(args),
+          runner);
     }
 
-    @SuppressWarnings("unchecked")
+    @SuppressWarnings({"unchecked", "rawtypes"})
     @Override
     protected Supplier<PipelineOptions> getPipelineOptionsFactory() {
       return () -> {
@@ -114,7 +121,7 @@ public abstract class BeamStreamProvider implements StreamProvider {
           remaining.add(arg);
         }
       }
-      return remaining.toArray(new String[remaining.size()]);
+      return remaining.toArray(new String[] {});
     }
   }
 
@@ -201,6 +208,12 @@ public abstract class BeamStreamProvider implements StreamProvider {
     UnaryFunction<PipelineOptions, Pipeline> createPipeline = getCreatePipelineFromOpts();
     return () -> {
       PipelineOptions opts = factory.get();
+      ExperimentalOptions experimentOpts = opts.as(ExperimentalOptions.class);
+      ArrayList<String> experiments =
+          Lists.newArrayList(
+              MoreObjects.firstNonNull(experimentOpts.getExperiments(), new ArrayList<>()));
+      experiments.add("use_deprecated_read");
+      experimentOpts.setExperiments(experiments);
       Pipeline pipeline = createPipeline.apply(opts);
       createUdfJarAndRegisterToPipeline(pipeline.getOptions());
       return pipeline;

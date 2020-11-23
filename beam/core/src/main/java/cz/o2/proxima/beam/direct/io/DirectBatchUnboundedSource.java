@@ -16,14 +16,14 @@
 package cz.o2.proxima.beam.direct.io;
 
 import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import cz.o2.proxima.beam.core.io.StreamElementCoder;
-import cz.o2.proxima.beam.direct.io.DirectDataAccessorWrapper.ConfigReader;
-import cz.o2.proxima.direct.batch.BatchLogObservable;
-import cz.o2.proxima.direct.batch.BatchLogObserver;
-import cz.o2.proxima.direct.core.Partition;
+import cz.o2.proxima.direct.batch.BatchLogReader;
+import cz.o2.proxima.direct.batch.ObserveHandle;
 import cz.o2.proxima.repository.AttributeDescriptor;
 import cz.o2.proxima.repository.RepositoryFactory;
+import cz.o2.proxima.storage.Partition;
 import cz.o2.proxima.storage.StreamElement;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -39,12 +39,10 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Objects;
-import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.Optional;
 import java.util.stream.Collectors;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
@@ -59,35 +57,25 @@ import org.apache.beam.sdk.options.PipelineOptions;
 import org.apache.beam.sdk.transforms.windowing.BoundedWindow;
 import org.joda.time.Instant;
 
-/**
- * Source reading from {@link BatchLogObservable} in unbounded manner. The source can be configured
- * using repository config as follows:
- *
- * <pre>
- *   beam.unbounded-batch {
- *     my-source {
- *       uri = &lt;storageUri of batch updates attribute family&gt;
- *       throughput = &lt;throughput in bytes per second per reader&gt;
- *     }
- *   }
- * </pre>
- */
+/** Source reading from {@link BatchLogReader} in unbounded manner. */
 @Slf4j
 public class DirectBatchUnboundedSource
     extends UnboundedSource<StreamElement, DirectBatchUnboundedSource.Checkpoint> {
 
   private static final long serialVersionUID = 1L;
 
+  public static final String CFG_ENABLE_CHECKPOINT_PARTITION_MERGE =
+      "checkpoint-partition-merge-enabled";
+
   public static DirectBatchUnboundedSource of(
       RepositoryFactory factory,
-      BatchLogObservable reader,
-      ConfigReader configReader,
+      BatchLogReader reader,
       List<AttributeDescriptor<?>> attrs,
       long startStamp,
-      long endStamp) {
+      long endStamp,
+      Map<String, Object> cfg) {
 
-    return new DirectBatchUnboundedSource(
-        factory, reader, configReader, attrs, startStamp, endStamp);
+    return new DirectBatchUnboundedSource(factory, reader, attrs, startStamp, endStamp, cfg);
   }
 
   @ToString
@@ -132,8 +120,7 @@ public class DirectBatchUnboundedSource
     }
 
     @Override
-    public Checkpoint decode(InputStream inStream) throws CoderException, IOException {
-
+    public Checkpoint decode(InputStream inStream) throws IOException {
       DataInputStream dis = new DataInputStream(inStream);
       int length = dis.readInt();
       byte[] bytes = new byte[length];
@@ -159,28 +146,31 @@ public class DirectBatchUnboundedSource
   }
 
   private final RepositoryFactory repositoryFactory;
-  private final BatchLogObservable reader;
+  private final BatchLogReader.Factory<?> readerFactory;
   private final List<AttributeDescriptor<?>> attributes;
-  private final List<Partition> partitions;
   private final long startStamp;
   private final long endStamp;
-  private final ConfigReader configReader;
+  private final boolean enableCheckpointPartitionMerge;
+  private transient @Nullable BatchLogReader reader;
+  // transient, (de)serialization handled outside of default(Read|Write)Object
+  private transient List<Partition> partitions;
 
   private DirectBatchUnboundedSource(
       RepositoryFactory repositoryFactory,
-      BatchLogObservable reader,
-      ConfigReader configReader,
+      BatchLogReader reader,
       List<AttributeDescriptor<?>> attributes,
       long startStamp,
-      long endStamp) {
+      long endStamp,
+      Map<String, Object> cfg) {
 
     this.repositoryFactory = repositoryFactory;
-    this.reader = reader;
+    this.readerFactory = reader.asFactory();
     this.attributes = Collections.unmodifiableList(attributes);
     this.partitions = Collections.emptyList();
     this.startStamp = startStamp;
     this.endStamp = endStamp;
-    this.configReader = configReader;
+    this.reader = reader;
+    this.enableCheckpointPartitionMerge = isEnableCheckpointPartitionMerge(cfg);
   }
 
   private DirectBatchUnboundedSource(
@@ -190,19 +180,31 @@ public class DirectBatchUnboundedSource
       long endStamp) {
 
     this.repositoryFactory = parent.repositoryFactory;
-    this.reader = parent.reader;
+    this.readerFactory = parent.readerFactory;
     this.attributes = parent.attributes;
     this.startStamp = startStamp;
     this.endStamp = endStamp;
+    this.enableCheckpointPartitionMerge = parent.enableCheckpointPartitionMerge;
     List<Partition> parts = Lists.newArrayList(partitions);
-    parts.sort(partitionsComparator());
+    parts.sort(Comparator.naturalOrder());
     this.partitions = Collections.unmodifiableList(parts);
     if (log.isDebugEnabled()) {
       log.debug(
           "Created source with partition min timestamps {}",
           parts.stream().map(Partition::getMinTimestamp).collect(Collectors.toList()));
     }
-    this.configReader = parent.configReader;
+  }
+
+  @VisibleForTesting
+  static boolean isEnableCheckpointPartitionMerge(Map<String, Object> cfg) {
+    return getBool(CFG_ENABLE_CHECKPOINT_PARTITION_MERGE, cfg);
+  }
+
+  private static boolean getBool(String name, Map<String, Object> cfg) {
+    return Optional.ofNullable(cfg.get(name))
+        .map(Object::toString)
+        .map(Boolean::valueOf)
+        .orElse(false);
   }
 
   @Override
@@ -211,7 +213,12 @@ public class DirectBatchUnboundedSource
 
     if (partitions.isEmpty()) {
       // round robin
-      List<Partition> parts = reader.getPartitions(startStamp, endStamp);
+      List<Partition> parts =
+          reader()
+              .getPartitions(startStamp, endStamp)
+              .stream()
+              .sorted()
+              .collect(Collectors.toList());
       List<List<Partition>> splits = new ArrayList<>();
       int current = 0;
       for (Partition p : parts) {
@@ -235,9 +242,42 @@ public class DirectBatchUnboundedSource
 
     List<Partition> toProcess =
         Collections.synchronizedList(
-            new ArrayList<>(checkpointMark == null ? partitions : checkpointMark.partitions));
+            new ArrayList<>(
+                checkpointMark == null
+                    ? partitions
+                    : merge(
+                        enableCheckpointPartitionMerge, partitions, checkpointMark.partitions)));
     return new StreamElementUnboundedReader(
-        DirectBatchUnboundedSource.this, reader, attributes, checkpointMark, toProcess);
+        DirectBatchUnboundedSource.this, reader(), attributes, checkpointMark, toProcess);
+  }
+
+  @VisibleForTesting
+  static List<Partition> merge(
+      boolean enabled, List<Partition> own, List<Partition> fromCheckpoint) {
+
+    if (enabled) {
+      List<Partition> ret = new ArrayList<>(fromCheckpoint);
+      Preconditions.checkArgument(
+          !fromCheckpoint.isEmpty(),
+          "Checkpoint partitions are already processed. "
+              + "This is unsupported for now, please use older checkpoint, if possible, or disable %s",
+          CFG_ENABLE_CHECKPOINT_PARTITION_MERGE);
+      fromCheckpoint
+          .stream()
+          .max(Comparator.naturalOrder())
+          .ifPresent(
+              partition ->
+                  own.stream().sorted().filter(p -> p.compareTo(partition) > 0).forEach(ret::add));
+      return ret;
+    }
+    return fromCheckpoint;
+  }
+
+  private BatchLogReader reader() {
+    if (reader == null) {
+      reader = readerFactory.apply(repositoryFactory.apply());
+    }
+    return reader;
   }
 
   @Override
@@ -250,75 +290,50 @@ public class DirectBatchUnboundedSource
     return StreamElementCoder.of(repositoryFactory);
   }
 
-  @VisibleForTesting
-  static Comparator<Partition> partitionsComparator() {
-    return (p1, p2) -> {
-      int cmp = Long.compare(p1.getMinTimestamp(), p2.getMinTimestamp());
-      if (cmp == 0) {
-        return Long.compare(p1.getMaxTimestamp(), p2.getMaxTimestamp());
+  private void writeObject(java.io.ObjectOutputStream stream) throws IOException {
+    stream.defaultWriteObject();
+    try (ByteArrayOutputStream baos = new ByteArrayOutputStream()) {
+      try (GZIPOutputStream gzip = new GZIPOutputStream(baos);
+          ObjectOutputStream oos = new ObjectOutputStream(gzip)) {
+        oos.writeObject(partitions);
       }
-      return cmp;
-    };
+      byte[] bytes = baos.toByteArray();
+      stream.writeInt(bytes.length);
+      stream.write(bytes);
+    }
   }
 
-  private static BatchLogObserver asObserver(
-      BlockingQueue<StreamElement> queue, AtomicBoolean running, AtomicBoolean stopped) {
-
-    return new BatchLogObserver() {
-
-      @Override
-      public boolean onNext(StreamElement element) {
-        try {
-          while (!stopped.get()) {
-            if (queue.offer(element, 100, TimeUnit.MILLISECONDS)) {
-              return true;
-            }
-            // the queue is full, give it another round
-          }
-        } catch (InterruptedException ex) {
-          log.warn("Interrupted while reading data.", ex);
-          Thread.currentThread().interrupt();
-        }
-        return false;
-      }
-
-      @Override
-      public void onCompleted() {
-        running.set(false);
-      }
-
-      @Override
-      public boolean onError(Throwable error) {
-        throw new RuntimeException(error);
-      }
-    };
-  }
-
-  private long getMaxThroughput() {
-    return configReader.getBytesPerSecThroughput(repositoryFactory.apply());
+  @SuppressWarnings("unchecked")
+  private void readObject(java.io.ObjectInputStream stream)
+      throws IOException, ClassNotFoundException {
+    stream.defaultReadObject();
+    byte[] bytes = new byte[stream.readInt()];
+    stream.readFully(bytes);
+    try (ByteArrayInputStream bais = new ByteArrayInputStream(bytes);
+        GZIPInputStream gzip = new GZIPInputStream(bais);
+        ObjectInputStream ois = new ObjectInputStream(gzip)) {
+      this.partitions = (List<Partition>) ois.readObject();
+    }
   }
 
   private static class StreamElementUnboundedReader extends UnboundedReader<StreamElement> {
 
     private final DirectBatchUnboundedSource source;
-    private final BatchLogObservable reader;
+    private final BatchLogReader reader;
     private final List<AttributeDescriptor<?>> attributes;
     private final List<Partition> toProcess;
-    private final BlockingQueue<StreamElement> queue = new ArrayBlockingQueue<>(100);
-    private final AtomicBoolean running = new AtomicBoolean();
-    private final AtomicBoolean stopped = new AtomicBoolean();
-    private final long createdNanoTime = System.nanoTime();
+    @Nullable private BlockingQueueLogObserver observer;
 
-    long consumedFromCurrent;
-    @Nullable StreamElement current = null;
-    long skip;
-    Instant watermark;
-    @Nullable Partition runningPartition = null;
-    long bytesConsumed = 0L;
+    private long consumedFromCurrent;
+    @Nullable private StreamElement current = null;
+    private long skip;
+    @Nullable private Partition runningPartition = null;
+    @Nullable private ObserveHandle runningHandle = null;
+    private long watermark = Long.MIN_VALUE;
 
     public StreamElementUnboundedReader(
         DirectBatchUnboundedSource source,
-        BatchLogObservable reader,
+        BatchLogReader reader,
         List<AttributeDescriptor<?>> attributes,
         @Nullable Checkpoint checkpointMark,
         List<Partition> toProcess) {
@@ -326,76 +341,71 @@ public class DirectBatchUnboundedSource
       this.source = Objects.requireNonNull(source);
       this.reader = Objects.requireNonNull(reader);
       this.attributes = new ArrayList<>(Objects.requireNonNull(attributes));
-      this.toProcess = new ArrayList<>(Objects.requireNonNull(toProcess));
+      this.toProcess = toProcess.stream().sorted().collect(Collectors.toList());
       this.consumedFromCurrent = 0;
       this.skip = checkpointMark == null ? 0 : checkpointMark.skipFromFirst;
-      log.info(
-          "Created {} reading from {} with max throughput {}",
-          getClass().getSimpleName(),
-          reader,
-          source.getMaxThroughput());
+      log.info("Created {} reading from {}", getClass().getSimpleName(), reader);
+      Preconditions.checkArgument(
+          toProcess.stream().map(Partition::getId).distinct().count() == toProcess.size(),
+          "List of partitions to process must contain unique partitions, got %s",
+          toProcess);
     }
 
     @Override
-    public boolean start() {
+    public boolean start() throws IOException {
       return advance();
     }
 
     @Override
-    public boolean advance() {
-      if (exceededThroughput()) {
-        return false;
-      }
+    public boolean advance() throws IOException {
       do {
-        if (queue.isEmpty() && !running.get()) {
-          if (runningPartition != null) {
-            toProcess.remove(0);
-            runningPartition = null;
-          }
-          if (!toProcess.isEmpty()) {
-            // read partitions one by one
-            runningPartition = toProcess.get(0);
-            reader.observe(
-                Collections.singletonList(runningPartition),
-                attributes,
-                asObserver(queue, running, stopped));
-            running.set(true);
-            watermark = new Instant(runningPartition.getMinTimestamp());
-            consumedFromCurrent = 0;
-          } else {
-            watermark = BoundedWindow.TIMESTAMP_MAX_VALUE;
-            return false;
-          }
+        if (observer == null && !startNewObserver()) {
+          return false;
         }
-        current = queue.poll();
+        watermark = observer.getWatermark();
+        current = observer.take();
         if (current == null) {
+          if (observer.getWatermark() == Long.MAX_VALUE) {
+            Throwable error = observer.getError();
+            if (error != null) {
+              throw new IOException(error);
+            }
+            observer = null;
+          }
           return false;
         }
         consumedFromCurrent++;
       } while (skip-- > 0);
-      bytesConsumed += sizeOf(current);
       return true;
     }
 
-    private static int sizeOf(StreamElement element) {
-      return (element.isDelete() ? 0 : element.getValue().length)
-          + element.getKey().length()
-          + element.getAttribute().length()
-          + element.getUuid().length();
-    }
-
-    private boolean exceededThroughput() {
-      if (source.getMaxThroughput() < 0) {
+    private boolean startNewObserver() {
+      if (runningPartition != null) {
+        toProcess.remove(0);
+        runningPartition = null;
+      }
+      if (!toProcess.isEmpty()) {
+        // read partitions one by one
+        runningPartition = toProcess.get(0);
+        observer = newObserver(runningPartition);
+        runningHandle =
+            reader.observe(Collections.singletonList(runningPartition), attributes, observer);
+        consumedFromCurrent = 0;
+      } else {
+        watermark = Long.MAX_VALUE;
         return false;
       }
-      long nanoNow = System.nanoTime();
-      long durationSeconds = (nanoNow - createdNanoTime) / 1_000_000_000L;
-      return bytesConsumed > durationSeconds * source.getMaxThroughput();
+      return true;
+    }
+
+    private BlockingQueueLogObserver newObserver(Partition partition) {
+      return BlockingQueueLogObserver.create(
+          "DirectBatchUnbounded:" + partition.getId(), Long.MIN_VALUE);
     }
 
     @Override
     public Instant getWatermark() {
-      return watermark;
+      return Instant.ofEpochMilli(watermark);
     }
 
     @Override
@@ -423,7 +433,8 @@ public class DirectBatchUnboundedSource
 
     @Override
     public void close() {
-      stopped.set(true);
+      Optional.ofNullable(observer).ifPresent(BlockingQueueLogObserver::stop);
+      Optional.ofNullable(runningHandle).ifPresent(ObserveHandle::close);
     }
   }
 }

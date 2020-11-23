@@ -15,13 +15,12 @@
  */
 package cz.o2.proxima.beam.direct.io;
 
-import cz.o2.proxima.direct.batch.BatchLogObservable;
-import cz.o2.proxima.direct.core.Partition;
+import cz.o2.proxima.direct.batch.BatchLogReader;
 import cz.o2.proxima.repository.AttributeDescriptor;
 import cz.o2.proxima.repository.RepositoryFactory;
+import cz.o2.proxima.storage.Partition;
 import cz.o2.proxima.storage.StreamElement;
-import java.io.IOException;
-import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
 import java.util.stream.Collectors;
@@ -30,7 +29,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.apache.beam.sdk.io.BoundedSource;
 import org.apache.beam.sdk.options.PipelineOptions;
 
-/** An {@link BoundedSource} created from direct operator's {@link BatchLogObservable}. */
+/** An {@link BoundedSource} created from direct operator's {@link BatchLogReader}. */
 @Slf4j
 public class DirectBatchSource extends AbstractDirectBoundedSource {
 
@@ -38,7 +37,7 @@ public class DirectBatchSource extends AbstractDirectBoundedSource {
 
   static DirectBatchSource of(
       RepositoryFactory factory,
-      BatchLogObservable reader,
+      BatchLogReader reader,
       List<AttributeDescriptor<?>> attrs,
       long startStamp,
       long endStamp) {
@@ -46,21 +45,23 @@ public class DirectBatchSource extends AbstractDirectBoundedSource {
     return new DirectBatchSource(factory, reader, attrs, startStamp, endStamp);
   }
 
-  private final BatchLogObservable reader;
+  private final BatchLogReader.Factory<?> readerFactory;
   private final List<AttributeDescriptor<?>> attrs;
   private final long startStamp;
   private final long endStamp;
   private final @Nullable Partition split;
+  // need this to be able to deserialize old format
+  private transient BatchLogReader reader;
 
   private DirectBatchSource(
       RepositoryFactory factory,
-      BatchLogObservable reader,
+      BatchLogReader reader,
       List<AttributeDescriptor<?>> attrs,
       long startStamp,
       long endStamp) {
 
     super(factory);
-    this.reader = Objects.requireNonNull(reader);
+    this.readerFactory = Objects.requireNonNull(reader).asFactory();
     this.attrs = Objects.requireNonNull(attrs);
     this.startStamp = startStamp;
     this.endStamp = endStamp;
@@ -69,21 +70,21 @@ public class DirectBatchSource extends AbstractDirectBoundedSource {
 
   private DirectBatchSource(DirectBatchSource parent, Partition split) {
     super(parent.factory);
-    this.reader = parent.reader;
+    this.readerFactory = parent.readerFactory;
     this.attrs = parent.attrs;
     this.startStamp = parent.startStamp;
     this.endStamp = parent.endStamp;
-    this.split = split;
+    this.split = Objects.requireNonNull(split);
   }
 
   @Override
   public List<? extends BoundedSource<StreamElement>> split(
-      long desiredBundleSizeBytes, PipelineOptions arg1) throws Exception {
+      long desiredBundleSizeBytes, PipelineOptions arg1) {
 
     if (split != null) {
-      return Arrays.asList(this);
+      return Collections.singletonList(this);
     }
-    return reader
+    return reader()
         .getPartitions(startStamp, endStamp)
         .stream()
         .map(p -> new DirectBatchSource(this, p))
@@ -91,8 +92,14 @@ public class DirectBatchSource extends AbstractDirectBoundedSource {
   }
 
   @Override
-  public BoundedReader<StreamElement> createReader(PipelineOptions options) throws IOException {
+  public BoundedReader<StreamElement> createReader(PipelineOptions options) {
+    return BeamBatchLogReader.of(this, reader(), attrs, split, startStamp, endStamp);
+  }
 
-    return BeamBatchLogReader.of(this, reader, attrs, split, startStamp, endStamp);
+  private BatchLogReader reader() {
+    if (reader == null) {
+      reader = readerFactory.apply(factory.apply());
+    }
+    return reader;
   }
 }

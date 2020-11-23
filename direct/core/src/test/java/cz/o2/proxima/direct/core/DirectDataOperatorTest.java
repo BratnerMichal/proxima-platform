@@ -22,6 +22,7 @@ import com.google.common.collect.Iterables;
 import com.typesafe.config.Config;
 import com.typesafe.config.ConfigFactory;
 import cz.o2.proxima.direct.commitlog.CommitLogReader;
+import cz.o2.proxima.direct.commitlog.CommitLogReaders.LimitedCommitLogReader;
 import cz.o2.proxima.direct.commitlog.LogObserver;
 import cz.o2.proxima.direct.randomaccess.KeyValue;
 import cz.o2.proxima.direct.randomaccess.RandomAccessReader;
@@ -36,13 +37,20 @@ import cz.o2.proxima.repository.TransformationDescriptor;
 import cz.o2.proxima.storage.PassthroughFilter;
 import cz.o2.proxima.storage.StorageType;
 import cz.o2.proxima.storage.StreamElement;
+import cz.o2.proxima.storage.ThroughputLimiter;
+import cz.o2.proxima.storage.internal.AbstractDataAccessorFactory.Accept;
+import cz.o2.proxima.storage.watermark.GlobalWatermarkThroughputLimiter;
+import cz.o2.proxima.storage.watermark.GlobalWatermarkThroughputLimiterTest.TestTracker;
+import cz.o2.proxima.storage.watermark.GlobalWatermarkTracker;
 import cz.o2.proxima.transform.ElementWiseTransformation;
 import cz.o2.proxima.transform.EventDataToDummy;
 import cz.o2.proxima.util.DummyFilter;
 import cz.o2.proxima.util.TestUtils;
 import cz.o2.proxima.util.TransformationRunner;
+import java.io.IOException;
 import java.io.NotSerializableException;
 import java.io.UnsupportedEncodingException;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -73,7 +81,14 @@ public class DirectDataOperatorTest {
                     .withFallback(ConfigFactory.load("test-reference.conf"))
                     .resolve())
             .build();
-    this.direct = repo.asDataOperator(DirectDataOperator.class);
+    this.direct = repo.getOrCreateOperator(DirectDataOperator.class);
+  }
+
+  @Test
+  public void testContextSerializable() throws IOException, ClassNotFoundException {
+    byte[] bytes = TestUtils.serializeObject(direct.getContext());
+    Context deserialized = TestUtils.deserializeObject(bytes);
+    assertNotNull(deserialized);
   }
 
   @Test
@@ -732,71 +747,6 @@ public class DirectDataOperatorTest {
         repo.getTransformations().get("_dummyReplicationMasterSlave_slave");
     assertNotNull(desc);
     assertEquals(DummyFilter.class, desc.getFilter().getClass());
-  }
-
-  private void testReplicationWriteObserveInternal(
-      Config config, boolean localWrite, boolean expectNonEmpty) throws InterruptedException {
-
-    repo.reloadConfig(true, config);
-    EntityDescriptor gateway = repo.getEntity("gateway");
-    AttributeDescriptor<Object> armed = gateway.getAttribute("armed");
-
-    AttributeDescriptor<Object> armedWrite =
-        gateway.getAttribute(
-            localWrite ? "_gatewayReplication_write$armed" : "_gatewayReplication_replicated$armed",
-            true);
-
-    // observe stream
-    CommitLogReader reader =
-        direct
-            .getFamiliesForAttribute(armed)
-            .stream()
-            .filter(af -> af.getDesc().getAccess().canReadCommitLog())
-            .findAny()
-            .flatMap(DirectAttributeFamilyDescriptor::getCommitLogReader)
-            .orElseThrow(() -> new IllegalStateException("Missing commit log reader for armed"));
-
-    List<StreamElement> observed = new ArrayList<>();
-    reader.observe(
-        "dummy",
-        new LogObserver() {
-          @Override
-          public boolean onNext(StreamElement ingest, OnNextContext context) {
-            if (!expectNonEmpty) {
-              fail("No input was expected.");
-            }
-            observed.add(ingest);
-            return true;
-          }
-
-          @Override
-          public boolean onError(Throwable error) {
-            throw new RuntimeException(error);
-          }
-        });
-
-    // start replications
-    TransformationRunner.runTransformations(repo, direct);
-    assertTrue(direct.getWriter(armedWrite).isPresent());
-    OnlineAttributeWriter writer = direct.getWriter(armedWrite).get();
-    writer.write(
-        StreamElement.upsert(
-            gateway,
-            armedWrite,
-            "uuid",
-            "gw",
-            armedWrite.getName(),
-            System.currentTimeMillis(),
-            new byte[] {1, 2}),
-        (succ, exc) -> {
-          assertTrue(succ);
-        });
-    // wait till write propagates
-    TimeUnit.MILLISECONDS.sleep(300);
-    if (expectNonEmpty) {
-      assertEquals(1, observed.size());
-      assertEquals(armed, observed.get(0).getAttributeDescriptor());
-    }
   }
 
   @SuppressWarnings("unchecked")
@@ -1683,6 +1633,115 @@ public class DirectDataOperatorTest {
     AttributeDescriptor<Object> armed = gateway.getAttribute("armed");
 
     assertTrue(direct.getCachedView(armed).isPresent());
+  }
+
+  @Test
+  public void testDataAccessorFactoryClass() {
+    URI uri = URI.create("inmem://my-url");
+    Optional<DataAccessorFactory> maybeFactory = direct.getAccessorFactory(uri);
+    assertTrue(maybeFactory.isPresent());
+    DataAccessorFactory factory = maybeFactory.get();
+    assertEquals(DirectDataOperator.DelegateDataAccessorFactory.class, factory.getClass());
+    DataAccessorFactory delegate =
+        ((DirectDataOperator.DelegateDataAccessorFactory) factory).getDelegate();
+    assertEquals(Accept.ACCEPT, delegate.accepts(uri));
+    assertEquals(factory.accepts(uri), delegate.accepts(uri));
+    DataAccessor accessor =
+        factory.createAccessor(direct, repo.getEntity("gateway"), uri, Collections.emptyMap());
+    assertTrue(accessor.getWriter(direct.getContext()).isPresent());
+    assertTrue(accessor.getBatchLogReader(direct.getContext()).isPresent());
+    assertTrue(accessor.getCachedView(direct.getContext()).isPresent());
+    assertTrue(accessor.getCommitLogReader(direct.getContext()).isPresent());
+    assertTrue(accessor.getRandomAccessReader(direct.getContext()).isPresent());
+  }
+
+  @Test
+  public void testLimiterDataAccessor() {
+    repo.reloadConfig(
+        true,
+        ConfigFactory.load("test-limiter.conf")
+            .withFallback(ConfigFactory.load("test-reference.conf"))
+            .resolve());
+    DirectDataOperator direct = repo.getOrCreateOperator(DirectDataOperator.class);
+    DirectAttributeFamilyDescriptor family = direct.getFamilyByName("event-storage-stream");
+    Optional<CommitLogReader> maybeReader = family.getCommitLogReader();
+    assertTrue(maybeReader.isPresent());
+    CommitLogReader reader = maybeReader.get();
+    assertTrue(reader instanceof LimitedCommitLogReader);
+    LimitedCommitLogReader limitedReader = (LimitedCommitLogReader) reader;
+    ThroughputLimiter limiter = limitedReader.getLimiter();
+    assertNotNull(limiter);
+    assertTrue(limiter instanceof GlobalWatermarkThroughputLimiter);
+    GlobalWatermarkThroughputLimiter watermarkLimiter = (GlobalWatermarkThroughputLimiter) limiter;
+    GlobalWatermarkTracker tracker = watermarkLimiter.getTracker();
+    assertTrue(tracker instanceof TestTracker);
+    TestTracker testTracker = (TestTracker) tracker;
+    assertEquals(2, testTracker.getTestConf());
+  }
+
+  private void testReplicationWriteObserveInternal(
+      Config config, boolean localWrite, boolean expectNonEmpty) throws InterruptedException {
+
+    repo.reloadConfig(true, config);
+    EntityDescriptor gateway = repo.getEntity("gateway");
+    AttributeDescriptor<Object> armed = gateway.getAttribute("armed");
+
+    AttributeDescriptor<Object> armedWrite =
+        gateway.getAttribute(
+            localWrite ? "_gatewayReplication_write$armed" : "_gatewayReplication_replicated$armed",
+            true);
+
+    // observe stream
+    CommitLogReader reader =
+        direct
+            .getFamiliesForAttribute(armed)
+            .stream()
+            .filter(af -> af.getDesc().getAccess().canReadCommitLog())
+            .findAny()
+            .flatMap(DirectAttributeFamilyDescriptor::getCommitLogReader)
+            .orElseThrow(() -> new IllegalStateException("Missing commit log reader for armed"));
+
+    List<StreamElement> observed = new ArrayList<>();
+    reader.observe(
+        "dummy",
+        new LogObserver() {
+          @Override
+          public boolean onNext(StreamElement ingest, OnNextContext context) {
+            if (!expectNonEmpty) {
+              fail("No input was expected.");
+            }
+            observed.add(ingest);
+            return true;
+          }
+
+          @Override
+          public boolean onError(Throwable error) {
+            throw new RuntimeException(error);
+          }
+        });
+
+    // start replications
+    TransformationRunner.runTransformations(repo, direct);
+    assertTrue(direct.getWriter(armedWrite).isPresent());
+    OnlineAttributeWriter writer = direct.getWriter(armedWrite).get();
+    writer.write(
+        StreamElement.upsert(
+            gateway,
+            armedWrite,
+            "uuid",
+            "gw",
+            armedWrite.getName(),
+            System.currentTimeMillis(),
+            new byte[] {1, 2}),
+        (succ, exc) -> {
+          assertTrue(succ);
+        });
+    // wait till write propagates
+    TimeUnit.MILLISECONDS.sleep(300);
+    if (expectNonEmpty) {
+      assertEquals(1, observed.size());
+      assertEquals(armed, observed.get(0).getAttributeDescriptor());
+    }
   }
 
   // validate that given transformation transforms in the desired way
